@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, windows]
+        goarch: [amd64, arm64]
+        exclude:
+          - goos: windows
+            goarch: arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          BINARY_NAME=mini-proxy
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            BINARY_NAME=$BINARY_NAME.exe
+          fi
+          go build -o $BINARY_NAME .
+          
+          # Create archive
+          ARCHIVE_NAME=mini-proxy-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            ARCHIVE_NAME=mini-proxy-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}.zip
+            zip $ARCHIVE_NAME $BINARY_NAME readme.md sample-config.json LICENSE
+          else
+            tar -czvf $ARCHIVE_NAME $BINARY_NAME readme.md sample-config.json LICENSE
+          fi
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: ${{ env.ARCHIVE_NAME }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
