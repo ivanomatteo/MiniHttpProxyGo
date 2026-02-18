@@ -1,0 +1,7 @@
+{
+  "listen_addr": ":3128",
+  "parent_proxy": "http://127.0.0.1:8080",
+  "log_file": "proxy.log",
+  "debug": true,
+  "timeout_sec": 30
+}

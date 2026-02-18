@@ -1,0 +1,16 @@
+[Unit]
+Description=Mini HTTP Proxy con parent e autenticazione
+After=network.target
+
+[Service]
+Type=simple
+User=proxy
+Group=proxy
+WorkingDirectory=/opt/mini-proxy
+ExecStart=/opt/mini-proxy/mini-proxy -config /opt/mini-proxy/config.json
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
