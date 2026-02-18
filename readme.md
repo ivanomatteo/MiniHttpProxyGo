@@ -45,7 +45,8 @@ Edit `config.json`:
   "password": "your_password",
   "log_file": "proxy.log",
   "blocked_hosts": ["facebook.com", "ads.example.com"],
-  "timeout_sec": 30
+  "timeout_sec": 30,
+   "debug": true
 }
 ```
 
