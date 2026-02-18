@@ -10,6 +10,9 @@ A lightweight HTTP/HTTPS proxy written in Go. It supports parent proxy forwardin
 - **Service Integration**: Fully compatible with Systemd (Linux) and Service Control Manager (Windows).
 - **Graceful Shutdown**: Handles signals for clean termination.
 
+## Releases
+🚀 Download latest release from **[GitHub Releases](https://github.com/ivanomatteo/MiniHttpProxyGo/releases/latest)**.
+
 ## Configuration
 Create a `config.json` file (see `sample-config.json`):
 
