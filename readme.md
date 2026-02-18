@@ -1,4 +1,4 @@
-# Mini Proxy
+# Mini Http Proxy Go
 
 A lightweight HTTP/HTTPS proxy written in Go. It supports parent proxy forwarding with authentication, host blacklisting, and can run as a system service on both Windows and Linux.
 
