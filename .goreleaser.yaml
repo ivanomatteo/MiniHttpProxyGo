@@ -25,6 +25,10 @@ archives:
     files:
       - ReadMe.md
       - LICENSE*
+      - install.sh
+      - install.bat
+      - src: sample-config.json
+        dst: config.json
 
 checksum:
   name_template: "checksums.txt"
