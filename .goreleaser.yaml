@@ -28,6 +28,7 @@ archives:
       - install.sh
       - install.bat
       - uninstall.bat
+      - uninstall.sh
       - src: sample-config.json
         dst: config.json
 
