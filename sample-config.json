@@ -1,5 +1,5 @@
 {
-  "listen_addr": ":3129",
+  "listen_addr": "127.0.0.1:3129",
   "parent_proxy": "http://proxy.test:3128",
   "username": "",
   "password": "",
