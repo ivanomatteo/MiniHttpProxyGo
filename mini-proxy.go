@@ -20,15 +20,16 @@ import (
 
 // Config structure read from JSON file
 type Config struct {
-	ListenAddr   string   `json:"listen_addr"`    // e.g. ":3128"
-	ParentProxy  string   `json:"parent_proxy"`   // e.g. "http://proxy.example.local:8080"
-	Username     string   `json:"username"`       // basic auth username for parent
-	Password     string   `json:"password"`       // basic auth password for parent
-	LogFile      string   `json:"log_file"`       // e.g. "proxy.log"
+	ListenAddr   string   `json:"listen_addr"`   // e.g. ":3128"
+	ParentProxy  string   `json:"parent_proxy"`  // e.g. "http://proxy.example.local:8080"
+	Username     string   `json:"username"`      // basic auth username for parent
+	Password     string   `json:"password"`      // basic auth password for parent
+	LogFile      string   `json:"log_file"`      // e.g. "proxy.log"
 	BlockedHosts []string `json:"blocked_hosts"` // hosts to block (exact or suffix)
-	TimeoutSec   int      `json:"timeout_sec"`   // transport timeout
 	Debug        bool     `json:"debug"`         // enable debug logging (e.g. client process ID)
 }
+
+const connectTimeout = 30 * time.Second
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
@@ -83,15 +84,11 @@ func runProxy(cfgPath string, stopChan <-chan struct{}) error {
 		proxyAuth = "Basic " + base64.StdEncoding.EncodeToString([]byte(b))
 	}
 
-	if cfg.TimeoutSec == 0 {
-		cfg.TimeoutSec = 30
-	}
-
 	// transport that uses the parent proxy
 	transport := &http.Transport{
 		Proxy: http.ProxyURL(parentURL),
 		DialContext: (&net.Dialer{
-			Timeout:   time.Duration(cfg.TimeoutSec) * time.Second,
+			Timeout:   connectTimeout,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		TLSHandshakeTimeout: 10 * time.Second,
@@ -101,7 +98,6 @@ func runProxy(cfgPath string, stopChan <-chan struct{}) error {
 
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   time.Duration(cfg.TimeoutSec) * time.Second,
 	}
 
 	handler := func(w http.ResponseWriter, r *http.Request) {
@@ -230,7 +226,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, parent *url.URL, prox
 		}
 	}
 
-	upConn, err := net.DialTimeout("tcp", parentAddr, 30*time.Second)
+	upConn, err := net.DialTimeout("tcp", parentAddr, connectTimeout)
 	if err != nil {
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return fmt.Errorf("dial parent: %w", err)

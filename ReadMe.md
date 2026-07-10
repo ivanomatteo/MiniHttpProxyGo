@@ -24,7 +24,6 @@ Create a `config.json` file (see `sample-config.json`):
   "password": "your_password",
   "log_file": "proxy.log",
   "blocked_hosts": ["facebook.com", "ads.example.com"],
-  "timeout_sec": 30,
   "debug": true
 }
 ```
@@ -38,7 +37,6 @@ Create a `config.json` file (see `sample-config.json`):
 | `password` | (Optional) Password for parent proxy authentication. |
 | `log_file` | Path to the log file. If empty, logs to stdout. |
 | `blocked_hosts` | Array of hosts to block. Suffix matching is supported. |
-| `timeout_sec` | Timeout for network operations in seconds (default: 30). |
 | `debug` | Enable extended logging, including process identification for local requests. |
 
 ## Debug Mode: Process Identification

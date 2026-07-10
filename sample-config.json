@@ -6,6 +6,5 @@
   "log_file": "proxy.log",
   "blocked_hosts": [
   ],
-  "timeout_sec": 30,
   "debug": true
 }
