@@ -1,7 +1,7 @@
 #!/bin/bash
 
 
-export ALL_PROXY="http://127.0.0.1:8080"
+export ALL_PROXY="http://127.0.0.1:3129"
 
 export HTTP_PROXY="$ALL_PROXY"
 export HTTPS_PROXY="$ALL_PROXY"

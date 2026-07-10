@@ -33,11 +33,13 @@ Create a `config.json` file (see `sample-config.json`):
 |-------|-------------|
 | `listen_addr` | Address and port to listen on (e.g., `:3128`). |
 | `parent_proxy` | URL of the upstream proxy. |
-| `username` | (Optional) Username for parent proxy authentication. |
-| `password` | (Optional) Password for parent proxy authentication. |
+| `username` | Username for parent proxy authentication. Leave empty to omit it, set to `[ask]` to request it at console startup, or provide a fixed value. |
+| `password` | Password for parent proxy authentication. Leave empty to omit it, set to `[ask]` to request it at console startup, or provide a fixed value. |
 | `log_file` | Path to the log file. If empty, logs to stdout. |
 | `blocked_hosts` | Array of hosts to block. Suffix matching is supported. |
 | `debug` | Enable extended logging, including process identification for local requests. |
+
+Authentication is disabled when both `username` and `password` are empty. In console mode, each field set to `[ask]` is requested interactively at startup; password input is hidden and credentials are never written to the log. The `[ask]` value is not supported in service mode: startup fails with an error, because a service has no interactive console. Configure fixed credentials (or leave both fields empty) before installing or starting the service.
 
 ## Debug Mode: Process Identification
 When `debug` is set to `true`, the proxy attempts to identify the local process initiating the request.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -16,6 +17,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"golang.org/x/term"
 )
 
 // Config structure read from JSON file
@@ -33,14 +36,15 @@ const connectTimeout = 30 * time.Second
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
+	serviceMode := flag.Bool("service", false, "run in service mode (disables interactive prompts)")
 	flag.Parse()
 
-	if err := runService(*cfgPath); err != nil {
+	if err := runService(*cfgPath, *serviceMode); err != nil {
 		log.Fatalf("error: %v", err)
 	}
 }
 
-func runProxy(cfgPath string, stopChan <-chan struct{}) error {
+func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error {
 	cfgF, err := os.Open(cfgPath)
 	if err != nil {
 		return fmt.Errorf("open config: %w", err)
@@ -51,6 +55,14 @@ func runProxy(cfgPath string, stopChan <-chan struct{}) error {
 	dec := json.NewDecoder(cfgF)
 	if err := dec.Decode(&cfg); err != nil {
 		return fmt.Errorf("decode config: %w", err)
+	}
+	readPassword := func() (string, error) {
+		password, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Fprintln(os.Stdout)
+		return string(password), err
+	}
+	if err := resolveCredentials(&cfg, serviceMode, os.Stdin, os.Stdout, readPassword); err != nil {
+		return err
 	}
 
 	// setup logging
@@ -178,6 +190,49 @@ func runProxy(cfgPath string, stopChan <-chan struct{}) error {
 	logger.Printf("Starting mini proxy on %s, forwarding to %s", cfg.ListenAddr, cfg.ParentProxy)
 	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
 		return fmt.Errorf("server error: %w", err)
+	}
+	return nil
+}
+
+func resolveCredentials(cfg *Config, serviceMode bool, input io.Reader, output io.Writer, readPassword func() (string, error)) error {
+	const ask = "[ask]"
+	if cfg.Username != ask && cfg.Password != ask {
+		return nil
+	}
+	if serviceMode {
+		return fmt.Errorf("username/password cannot be %q in service mode", ask)
+	}
+
+	reader := bufio.NewReader(input)
+	readValue := func(prompt string) (string, error) {
+		if _, err := fmt.Fprint(output, prompt); err != nil {
+			return "", err
+		}
+		value, err := reader.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return "", err
+		}
+		if err == io.EOF && value == "" {
+			return "", fmt.Errorf("no value entered")
+		}
+		return strings.TrimRight(value, "\r\n"), nil
+	}
+
+	var err error
+	if cfg.Username == ask {
+		cfg.Username, err = readValue("Parent proxy username: ")
+		if err != nil {
+			return fmt.Errorf("read username: %w", err)
+		}
+	}
+	if cfg.Password == ask {
+		if _, err := fmt.Fprint(output, "Parent proxy password: "); err != nil {
+			return fmt.Errorf("write password prompt: %w", err)
+		}
+		cfg.Password, err = readPassword()
+		if err != nil {
+			return fmt.Errorf("read password: %w", err)
+		}
 	}
 	return nil
 }

@@ -1,11 +1,12 @@
 //go:build windows
+
 package main
 
 import (
 	"golang.org/x/sys/windows/svc"
 )
 
-func runService(cfgPath string) error {
+func runService(cfgPath string, serviceMode bool) error {
 	isSvc, err := svc.IsWindowsService()
 	if err != nil {
 		return err
@@ -17,7 +18,7 @@ func runService(cfgPath string) error {
 
 	// Run as normal console app
 	stopChan := make(chan struct{})
-	return runProxy(cfgPath, stopChan)
+	return runProxy(cfgPath, stopChan, serviceMode)
 }
 
 type proxyService struct {
@@ -32,7 +33,7 @@ func (m *proxyService) Execute(args []string, r <-chan svc.ChangeRequest, change
 	errChan := make(chan error, 1)
 
 	go func() {
-		errChan <- runProxy(m.cfgPath, stopChan)
+		errChan <- runProxy(m.cfgPath, stopChan, true)
 	}()
 
 	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
