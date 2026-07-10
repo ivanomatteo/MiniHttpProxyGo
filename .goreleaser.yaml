@@ -27,6 +27,7 @@ archives:
       - LICENSE*
       - install.sh
       - install.bat
+      - uninstall.bat
       - src: sample-config.json
         dst: config.json
 

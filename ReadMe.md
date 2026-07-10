@@ -73,6 +73,26 @@ This is particularly useful for auditing which applications are generating traff
    This will install the service using the Service Control Manager (SCM).
 3. The service `mini-proxy` will be created and started. Configuration and executable are located in `C:\mini-proxy`.
 
+## Uninstallation
+
+### Linux (Systemd)
+
+Run the uninstallation script as root:
+
+```bash
+sudo ./uninstall.sh
+```
+
+This stops and disables the `mini-proxy` service, removes its Systemd unit, and preserves `/opt/mini-proxy`, the configuration, and the dedicated user. To remove the installation directory, user, and group as well, use:
+
+```bash
+sudo ./uninstall.sh --purge
+```
+
+### Windows
+
+Run `uninstall.bat` as Administrator. The script stops and deletes the `mini-proxy` service, but preserves the installation directory `C:\mini-proxy`. Delete that directory manually if the configuration and installed files are no longer needed.
+
 ## Build
 To build for the current platform:
 ```bash
