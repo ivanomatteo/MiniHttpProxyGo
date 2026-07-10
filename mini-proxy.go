@@ -3,6 +3,10 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha1"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -32,6 +36,10 @@ type Config struct {
 	Debug        bool     `json:"debug"`         // enable debug logging (e.g. client process ID)
 }
 
+type encryptedPassword struct {
+	Encrypted string `json:"encrypted"`
+}
+
 const connectTimeout = 30 * time.Second
 
 func main() {
@@ -45,16 +53,9 @@ func main() {
 }
 
 func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error {
-	cfgF, err := os.Open(cfgPath)
+	cfg, err := loadConfig(cfgPath)
 	if err != nil {
-		return fmt.Errorf("open config: %w", err)
-	}
-	defer cfgF.Close()
-
-	var cfg Config
-	dec := json.NewDecoder(cfgF)
-	if err := dec.Decode(&cfg); err != nil {
-		return fmt.Errorf("decode config: %w", err)
+		return err
 	}
 	readPassword := func() (string, error) {
 		password, err := term.ReadPassword(int(os.Stdin.Fd()))
@@ -192,6 +193,187 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 		return fmt.Errorf("server error: %w", err)
 	}
 	return nil
+}
+
+func loadConfig(cfgPath string) (Config, error) {
+	var cfg Config
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return cfg, fmt.Errorf("open config: %w", err)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return cfg, fmt.Errorf("decode config: %w", err)
+	}
+
+	seed := ""
+	seedAdded := false
+	if seedJSON, ok := raw["key_seed"]; ok {
+		if err := json.Unmarshal(seedJSON, &seed); err != nil || seed == "" {
+			return cfg, fmt.Errorf("key_seed must be a non-empty string")
+		}
+	} else {
+		seed, err = randomSeed(20)
+		if err != nil {
+			return cfg, fmt.Errorf("generate key_seed: %w", err)
+		}
+		raw["key_seed"], _ = json.Marshal(seed)
+		seedAdded = true
+	}
+
+	passwordJSON, hasPassword := raw["password"]
+	if !hasPassword {
+		passwordJSON = json.RawMessage(`""`)
+	}
+	var plainPassword string
+	if err := json.Unmarshal(passwordJSON, &plainPassword); err != nil {
+		var encrypted encryptedPassword
+		if objectErr := json.Unmarshal(passwordJSON, &encrypted); objectErr != nil || encrypted.Encrypted == "" {
+			return cfg, fmt.Errorf("password must be a string or an object containing encrypted")
+		}
+		username, err := configUsername(raw)
+		if err != nil {
+			return cfg, err
+		}
+		plainPassword, err = decryptPassword(encrypted.Encrypted, seed, username)
+		if err != nil {
+			return cfg, fmt.Errorf("decrypt password: %w", err)
+		}
+	}
+
+	configForDecode := make(map[string]json.RawMessage, len(raw))
+	for key, value := range raw {
+		configForDecode[key] = value
+	}
+	configForDecode["password"], _ = json.Marshal(plainPassword)
+	decodeData, _ := json.Marshal(configForDecode)
+	if err := json.Unmarshal(decodeData, &cfg); err != nil {
+		return cfg, fmt.Errorf("decode config: %w", err)
+	}
+
+	needsWrite := seedAdded
+	// Empty and [ask] are control values, not secrets.
+	if plainPassword != "" && plainPassword != "[ask]" {
+		if passwordJSON[0] == '"' {
+			encoded, err := encryptPassword(plainPassword, seed, cfg.Username)
+			if err != nil {
+				return cfg, fmt.Errorf("encrypt password: %w", err)
+			}
+			raw["password"], _ = json.Marshal(encryptedPassword{Encrypted: encoded})
+			needsWrite = true
+		}
+	}
+	if needsWrite {
+		if err := writeConfig(cfgPath, raw); err != nil {
+			return cfg, fmt.Errorf("update config: %w", err)
+		}
+	}
+	return cfg, nil
+}
+
+func configUsername(raw map[string]json.RawMessage) (string, error) {
+	var username string
+	if value, ok := raw["username"]; ok {
+		if err := json.Unmarshal(value, &username); err != nil {
+			return "", fmt.Errorf("username must be a string")
+		}
+	}
+	return username, nil
+}
+
+func randomSeed(length int) (string, error) {
+	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	result := make([]byte, length)
+	random := make([]byte, length)
+	if _, err := rand.Read(random); err != nil {
+		return "", err
+	}
+	for i, value := range random {
+		result[i] = alphabet[int(value)%len(alphabet)]
+	}
+	return string(result), nil
+}
+
+func passwordKey(seed, username string) []byte {
+	seedHash := sha1.Sum([]byte(seed))
+	material := append(seedHash[:], []byte(username)...)
+	keyHash := sha1.Sum(material)
+	return keyHash[:aes.BlockSize]
+}
+
+func encryptPassword(password, seed, username string) (string, error) {
+	gcm, err := passwordCipher(seed, username)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", err
+	}
+	sealed := gcm.Seal(nonce, nonce, []byte(password), nil)
+	return base64.StdEncoding.EncodeToString(sealed), nil
+}
+
+func decryptPassword(encoded, seed, username string) (string, error) {
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("invalid base64: %w", err)
+	}
+	gcm, err := passwordCipher(seed, username)
+	if err != nil {
+		return "", err
+	}
+	if len(data) < gcm.NonceSize() {
+		return "", fmt.Errorf("encrypted value is too short")
+	}
+	plain, err := gcm.Open(nil, data[:gcm.NonceSize()], data[gcm.NonceSize():], nil)
+	if err != nil {
+		return "", fmt.Errorf("invalid key or encrypted value")
+	}
+	return string(plain), nil
+}
+
+func passwordCipher(seed, username string) (cipher.AEAD, error) {
+	block, err := aes.NewCipher(passwordKey(seed, username))
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+func writeConfig(path string, raw map[string]json.RawMessage) error {
+	data, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".mini-proxy-config-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 func resolveCredentials(cfg *Config, serviceMode bool, input io.Reader, output io.Writer, readPassword func() (string, error)) error {

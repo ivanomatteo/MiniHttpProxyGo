@@ -2,6 +2,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -56,5 +60,79 @@ func TestResolveCredentials(t *testing.T) {
 				t.Fatalf("password reader called %d times, want %d", passwordReads, wantPasswordReads)
 			}
 		})
+	}
+}
+
+func TestLoadConfigEncryptsPlainPasswordAndDecryptsIt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	initial := `{"listen_addr":":3128","parent_proxy":"http://proxy:8080","username":"alice","password":"very-secret","custom":"preserved"}`
+	if err := os.WriteFile(path, []byte(initial), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Password != "very-secret" {
+		t.Fatalf("password = %q", cfg.Password)
+	}
+
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(updated, []byte("very-secret")) {
+		t.Fatalf("plain password remains in config: %s", updated)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(updated, &raw); err != nil {
+		t.Fatal(err)
+	}
+	var seed string
+	if err := json.Unmarshal(raw["key_seed"], &seed); err != nil {
+		t.Fatal(err)
+	}
+	if !regexp.MustCompile(`^[a-zA-Z0-9]{20}$`).MatchString(seed) {
+		t.Fatalf("invalid key_seed %q", seed)
+	}
+	var encrypted encryptedPassword
+	if err := json.Unmarshal(raw["password"], &encrypted); err != nil || encrypted.Encrypted == "" {
+		t.Fatalf("invalid encrypted password: %s", raw["password"])
+	}
+	if string(raw["custom"]) != `"preserved"` {
+		t.Fatalf("unknown field was not preserved")
+	}
+
+	loadedAgain, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadedAgain.Password != "very-secret" {
+		t.Fatalf("decrypted password = %q", loadedAgain.Password)
+	}
+}
+
+func TestLoadConfigDoesNotEncryptAsk(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"username":"[ask]","password":"[ask]"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(path); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(updated, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if string(raw["password"]) != `"[ask]"` {
+		t.Fatalf("ask password changed to %s", raw["password"])
+	}
+	if _, ok := raw["key_seed"]; !ok {
+		t.Fatal("key_seed was not added")
 	}
 }
