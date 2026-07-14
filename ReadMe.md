@@ -24,7 +24,8 @@ Create a `config.json` file (see `sample-config.json`):
   "password": "your_password",
   "log_file": "proxy.log",
   "blocked_hosts": ["facebook.com", "ads.example.com"],
-  "debug": true
+  "debug": true,
+  "stop_if_auth_fail": true
 }
 ```
 
@@ -39,6 +40,7 @@ Create a `config.json` file (see `sample-config.json`):
 | `log_file` | Path to the log file. If empty, logs to stdout. |
 | `blocked_hosts` | Array of hosts to block. Suffix matching is supported. |
 | `debug` | Enable extended logging, including process identification for local requests. |
+| `stop_if_auth_fail` | Stop accepting connections when the parent proxy returns HTTP 407. Defaults to `true`; set to `false` to keep forwarding requests. |
 
 Authentication is disabled when both `username` and `password` are empty. In console mode, each field set to `[ask]` is requested interactively at startup; password input is hidden and credentials are never written to the log. The `[ask]` value is not supported in service mode: startup fails with an error, because a service has no interactive console. Configure fixed credentials (or leave both fields empty) before installing or starting the service.
 

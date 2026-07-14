@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -20,6 +21,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/term"
@@ -27,13 +30,14 @@ import (
 
 // Config structure read from JSON file
 type Config struct {
-	ListenAddr   string   `json:"listen_addr"`   // e.g. ":3128"
-	ParentProxy  string   `json:"parent_proxy"`  // e.g. "http://proxy.example.local:8080"
-	Username     string   `json:"username"`      // basic auth username for parent
-	Password     string   `json:"password"`      // basic auth password for parent
-	LogFile      string   `json:"log_file"`      // e.g. "proxy.log"
-	BlockedHosts []string `json:"blocked_hosts"` // hosts to block (exact or suffix)
-	Debug        bool     `json:"debug"`         // enable debug logging (e.g. client process ID)
+	ListenAddr     string   `json:"listen_addr"`       // e.g. ":3128"
+	ParentProxy    string   `json:"parent_proxy"`      // e.g. "http://proxy.example.local:8080"
+	Username       string   `json:"username"`          // basic auth username for parent
+	Password       string   `json:"password"`          // basic auth password for parent
+	LogFile        string   `json:"log_file"`          // e.g. "proxy.log"
+	BlockedHosts   []string `json:"blocked_hosts"`     // hosts to block (exact or suffix)
+	Debug          bool     `json:"debug"`             // enable debug logging (e.g. client process ID)
+	StopIfAuthFail bool     `json:"stop_if_auth_fail"` // stop when the parent proxy returns HTTP 407
 }
 
 type encryptedPassword struct {
@@ -68,6 +72,7 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 
 	// setup logging
 	var logOut io.Writer = os.Stdout
+	var logFile *os.File
 	if cfg.LogFile != "" {
 		logFilePath := cfg.LogFile
 		if !filepath.IsAbs(logFilePath) {
@@ -80,6 +85,8 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 		if err != nil {
 			return fmt.Errorf("open log file (%s): %w", logFilePath, err)
 		}
+		logFile = f
+		defer logFile.Close()
 		logOut = f
 	}
 	logger := log.New(logOut, "mini-proxy: ", log.LstdFlags)
@@ -113,7 +120,15 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 		Transport: transport,
 	}
 
+	var authenticationFailed atomic.Bool
+	var stopOnce sync.Once
+	var stopForAuthenticationFailure func()
+
 	handler := func(w http.ResponseWriter, r *http.Request) {
+		if authenticationFailed.Load() {
+			http.Error(w, "Proxy stopped: parent proxy authentication failed", http.StatusServiceUnavailable)
+			return
+		}
 		start := time.Now()
 		clientIP := r.RemoteAddr
 		targetHost := r.Host
@@ -136,12 +151,15 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 		if r.Method == http.MethodConnect {
 			if err := handleConnect(w, r, parentURL, proxyAuth, logger); err != nil {
 				logger.Printf("FAILED CONNECT %s%s %s -> %v", clientIP, procInfo, r.Host, err)
+				if cfg.StopIfAuthFail && errors.Is(err, errParentProxyAuthentication) {
+					stopForAuthenticationFailure()
+				}
 			}
 			logger.Printf("TUNNELED %s%s %s %s in %s", clientIP, procInfo, r.Method, r.Host, time.Since(start))
 			return
 		}
 
-		reqOut := r.Clone(context.Background())
+		reqOut := r.Clone(r.Context())
 		reqOut.RequestURI = ""
 		if !reqOut.URL.IsAbs() {
 			scheme := "http"
@@ -166,6 +184,9 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 			return
 		}
 		defer resp.Body.Close()
+		if cfg.StopIfAuthFail && resp.StatusCode == http.StatusProxyAuthRequired {
+			stopForAuthenticationFailure()
+		}
 
 		copyHeader(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
@@ -178,6 +199,22 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 	httpServer := &http.Server{
 		Addr:    cfg.ListenAddr,
 		Handler: http.HandlerFunc(handler),
+	}
+	stopForAuthenticationFailure = func() {
+		stopOnce.Do(func() {
+			authenticationFailed.Store(true)
+			message := "ERROR parent proxy rejected credentials or requires authentication; stopping proxy"
+			logger.Print(message)
+			if logFile != nil {
+				fmt.Fprintf(os.Stdout, "mini-proxy: %s\n", message)
+			}
+			transport.CloseIdleConnections()
+			go func() {
+				if err := httpServer.Close(); err != nil && err != http.ErrServerClosed {
+					logger.Printf("FAILED stopping server after parent authentication error: %v", err)
+				}
+			}()
+		})
 	}
 
 	go func() {
@@ -196,7 +233,7 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 }
 
 func loadConfig(cfgPath string) (Config, error) {
-	var cfg Config
+	cfg := Config{StopIfAuthFail: true}
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		return cfg, fmt.Errorf("open config: %w", err)
@@ -452,6 +489,8 @@ func copyHeader(dst, src http.Header) {
 }
 
 // handleConnect sends a CONNECT to the parent proxy (with Proxy-Authorization if provided) and then tunnels the TCP streams.
+var errParentProxyAuthentication = errors.New("parent proxy authentication required or rejected")
+
 func handleConnect(w http.ResponseWriter, r *http.Request, parent *url.URL, proxyAuth string, logger *log.Logger) error {
 	// dial to parent proxy
 	parentAddr := parent.Host
@@ -492,12 +531,19 @@ func handleConnect(w http.ResponseWriter, r *http.Request, parent *url.URL, prox
 		return fmt.Errorf("read CONNECT response: %w", err)
 	}
 	respStr := string(br[:n])
+	statusLine := strings.SplitN(respStr, "\r\n", 2)[0]
+	if err := parentConnectStatusError(statusLine); errors.Is(err, errParentProxyAuthentication) {
+		w.WriteHeader(http.StatusBadGateway)
+		w.Write([]byte("Parent proxy authentication failed\n"))
+		upConn.Close()
+		return err
+	}
 	if !strings.Contains(respStr, "200") {
 		// forward parent's response to client
 		w.WriteHeader(http.StatusBadGateway)
 		w.Write([]byte("Parent proxy refused CONNECT\n"))
 		upConn.Close()
-		return fmt.Errorf("parent CONNECT failed: %s", strings.SplitN(respStr, "\r\n", 2)[0])
+		return fmt.Errorf("parent CONNECT failed: %s", statusLine)
 	}
 
 	// Hijack client connection
@@ -533,5 +579,12 @@ func handleConnect(w http.ResponseWriter, r *http.Request, parent *url.URL, prox
 		io.Copy(clientConn, upConn)
 	}()
 
+	return nil
+}
+
+func parentConnectStatusError(statusLine string) error {
+	if strings.HasPrefix(statusLine, "HTTP/") && strings.Contains(statusLine, " 407 ") {
+		return fmt.Errorf("%w: %s", errParentProxyAuthentication, statusLine)
+	}
 	return nil
 }

@@ -3,12 +3,23 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 )
+
+func TestHandleConnectDetectsParentAuthenticationFailure(t *testing.T) {
+	err := parentConnectStatusError("HTTP/1.1 407 Proxy Authentication Required")
+	if !errors.Is(err, errParentProxyAuthentication) {
+		t.Fatalf("parentConnectStatusError() error = %v, want authentication failure", err)
+	}
+	if err := parentConnectStatusError("HTTP/1.1 403 Forbidden"); err != nil {
+		t.Fatalf("parentConnectStatusError() error = %v, want nil", err)
+	}
+}
 
 func TestResolveCredentials(t *testing.T) {
 	tests := []struct {
@@ -134,5 +145,33 @@ func TestLoadConfigDoesNotEncryptAsk(t *testing.T) {
 	}
 	if _, ok := raw["key_seed"]; !ok {
 		t.Fatal("key_seed was not added")
+	}
+}
+
+func TestLoadConfigStopIfAuthFail(t *testing.T) {
+	tests := []struct {
+		name string
+		json string
+		want bool
+	}{
+		{name: "defaults to true", json: `{}`, want: true},
+		{name: "explicit true", json: `{"stop_if_auth_fail":true}`, want: true},
+		{name: "explicit false", json: `{"stop_if_auth_fail":false}`, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(tt.json), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := loadConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.StopIfAuthFail != tt.want {
+				t.Fatalf("StopIfAuthFail = %v, want %v", cfg.StopIfAuthFail, tt.want)
+			}
+		})
 	}
 }

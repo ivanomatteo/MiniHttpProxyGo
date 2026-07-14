@@ -6,5 +6,6 @@
   "log_file": "proxy.log",
   "blocked_hosts": [
   ],
-  "debug": true
+  "debug": true,
+  "stop_if_auth_fail": true
 }
