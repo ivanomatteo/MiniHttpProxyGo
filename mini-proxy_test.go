@@ -1,14 +1,22 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestHandleConnectDetectsParentAuthenticationFailure(t *testing.T) {
@@ -18,6 +26,99 @@ func TestHandleConnectDetectsParentAuthenticationFailure(t *testing.T) {
 	}
 	if err := parentConnectStatusError("HTTP/1.1 403 Forbidden"); err != nil {
 		t.Fatalf("parentConnectStatusError() error = %v, want nil", err)
+	}
+}
+
+func TestHandleConnectPreservesBufferedTunnelBytes(t *testing.T) {
+	parentListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parentListener.Close()
+
+	parentDone := make(chan error, 1)
+	go func() {
+		conn, err := parentListener.Accept()
+		if err != nil {
+			parentDone <- err
+			return
+		}
+		defer conn.Close()
+		request, err := http.ReadRequest(bufio.NewReader(conn))
+		if err != nil {
+			parentDone <- err
+			return
+		}
+		request.Body.Close()
+		if _, err := io.WriteString(conn, "HTTP/1.1 200 Connection established\r\nProxy-Agent: test\r\n\r\n"); err != nil {
+			parentDone <- err
+			return
+		}
+		got := make([]byte, len("CLIENT"))
+		if _, err := io.ReadFull(conn, got); err != nil {
+			parentDone <- err
+			return
+		}
+		if string(got) != "CLIENT" {
+			parentDone <- errors.New("parent received incorrect tunneled bytes")
+			return
+		}
+		_, err = io.WriteString(conn, "SERVER")
+		parentDone <- err
+	}()
+
+	parentURL, err := url.Parse("http://" + parentListener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := handleConnect(w, r, parentURL, "", log.New(io.Discard, "", 0)); err != nil {
+			t.Errorf("handleConnect() error = %v", err)
+		}
+	}))
+	defer proxyServer.Close()
+
+	proxyAddr := strings.TrimPrefix(proxyServer.URL, "http://")
+	clientConn, err := net.DialTimeout("tcp", proxyAddr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConn.Close()
+	if err := clientConn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	// CONNECT and the first tunnel bytes deliberately share a write. The HTTP
+	// server commonly reads CLIENT into its bufio.Reader while parsing headers.
+	if _, err := io.WriteString(clientConn, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\nCLIENT"); err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(clientConn)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	got := make([]byte, len("SERVER"))
+	if _, err := io.ReadFull(reader, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "SERVER" {
+		t.Fatalf("client received %q, want SERVER", got)
+	}
+	clientConn.Close()
+
+	select {
+	case err := <-parentDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("parent did not receive buffered tunnel bytes")
 	}
 }
 

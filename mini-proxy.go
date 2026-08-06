@@ -154,8 +154,9 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 				if cfg.StopIfAuthFail && errors.Is(err, errParentProxyAuthentication) {
 					stopForAuthenticationFailure()
 				}
+			} else {
+				logger.Printf("TUNNELED %s%s %s %s in %s", clientIP, procInfo, r.Method, r.Host, time.Since(start))
 			}
-			logger.Printf("TUNNELED %s%s %s %s in %s", clientIP, procInfo, r.Method, r.Host, time.Since(start))
 			return
 		}
 
@@ -492,20 +493,14 @@ func copyHeader(dst, src http.Header) {
 var errParentProxyAuthentication = errors.New("parent proxy authentication required or rejected")
 
 func handleConnect(w http.ResponseWriter, r *http.Request, parent *url.URL, proxyAuth string, logger *log.Logger) error {
-	// dial to parent proxy
-	parentAddr := parent.Host
-	if !strings.Contains(parentAddr, ":") {
-		if parent.Scheme == "https" {
-			parentAddr = parentAddr + ":443"
-		} else {
-			parentAddr = parentAddr + ":80"
-		}
-	}
-
-	upConn, err := net.DialTimeout("tcp", parentAddr, connectTimeout)
+	upConn, err := dialParentProxy(parent)
 	if err != nil {
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return fmt.Errorf("dial parent: %w", err)
+	}
+	defer upConn.Close()
+	if err := upConn.SetDeadline(time.Now().Add(connectTimeout)); err != nil {
+		return fmt.Errorf("set parent CONNECT deadline: %w", err)
 	}
 
 	// send CONNECT request to parent
@@ -517,33 +512,32 @@ func handleConnect(w http.ResponseWriter, r *http.Request, parent *url.URL, prox
 	reqLines = append(reqLines, "\r\n")
 	connectReq := strings.Join(reqLines, "\r\n")
 	if _, err := upConn.Write([]byte(connectReq)); err != nil {
-		upConn.Close()
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return fmt.Errorf("write CONNECT to parent: %w", err)
 	}
 
-	// read response status line from parent
-	br := make([]byte, 4096)
-	n, err := upConn.Read(br)
+	// Parse the complete HTTP response without consuming any bytes belonging to
+	// the tunneled connection that may already have arrived after its headers.
+	upReader := bufio.NewReader(upConn)
+	connectResponse, err := http.ReadResponse(upReader, &http.Request{Method: http.MethodConnect})
 	if err != nil {
-		upConn.Close()
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return fmt.Errorf("read CONNECT response: %w", err)
 	}
-	respStr := string(br[:n])
-	statusLine := strings.SplitN(respStr, "\r\n", 2)[0]
-	if err := parentConnectStatusError(statusLine); errors.Is(err, errParentProxyAuthentication) {
+	if connectResponse.StatusCode == http.StatusProxyAuthRequired {
+		connectResponse.Body.Close()
 		w.WriteHeader(http.StatusBadGateway)
 		w.Write([]byte("Parent proxy authentication failed\n"))
-		upConn.Close()
-		return err
+		return fmt.Errorf("%w: %s", errParentProxyAuthentication, connectResponse.Status)
 	}
-	if !strings.Contains(respStr, "200") {
-		// forward parent's response to client
+	if connectResponse.StatusCode < 200 || connectResponse.StatusCode >= 300 {
+		connectResponse.Body.Close()
 		w.WriteHeader(http.StatusBadGateway)
 		w.Write([]byte("Parent proxy refused CONNECT\n"))
-		upConn.Close()
-		return fmt.Errorf("parent CONNECT failed: %s", statusLine)
+		return fmt.Errorf("parent CONNECT failed: %s", connectResponse.Status)
+	}
+	if err := upConn.SetDeadline(time.Time{}); err != nil {
+		return fmt.Errorf("clear parent CONNECT deadline: %w", err)
 	}
 
 	// Hijack client connection
@@ -553,32 +547,83 @@ func handleConnect(w http.ResponseWriter, r *http.Request, parent *url.URL, prox
 		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
 		return fmt.Errorf("hijack not supported")
 	}
-	clientConn, _, err := hj.Hijack()
+	clientConn, clientRW, err := hj.Hijack()
 	if err != nil {
-		upConn.Close()
 		http.Error(w, "Hijack failed", http.StatusInternalServerError)
 		return fmt.Errorf("hijack: %w", err)
 	}
+	defer clientConn.Close()
 
 	// write 200 OK to client to signify tunnel established
-	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n")); err != nil {
-		clientConn.Close()
-		upConn.Close()
+	if _, err := clientRW.WriteString("HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
 		return fmt.Errorf("write 200 to client: %w", err)
 	}
+	if err := clientRW.Flush(); err != nil {
+		return fmt.Errorf("flush 200 to client: %w", err)
+	}
 
-	// Now copy bidirectionally
-	go func() {
-		defer clientConn.Close()
-		defer upConn.Close()
-		io.Copy(upConn, clientConn)
-	}()
-	go func() {
-		defer clientConn.Close()
-		defer upConn.Close()
-		io.Copy(clientConn, upConn)
-	}()
+	// clientRW.Reader and upReader preserve bytes which were read ahead while
+	// parsing CONNECT. Dropping either buffer can lose a TLS ClientHello or the
+	// first bytes returned by the destination.
+	return relayTunnel(clientConn, clientRW.Reader, upConn, upReader, logger)
+}
 
+func dialParentProxy(parent *url.URL) (net.Conn, error) {
+	parentAddr := parent.Host
+	if _, _, err := net.SplitHostPort(parentAddr); err != nil {
+		defaultPort := "80"
+		if parent.Scheme == "https" {
+			defaultPort = "443"
+		}
+		parentAddr = net.JoinHostPort(parent.Hostname(), defaultPort)
+	}
+
+	dialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
+	switch parent.Scheme {
+	case "http":
+		return dialer.Dial("tcp", parentAddr)
+	case "https":
+		return tls.DialWithDialer(dialer, "tcp", parentAddr, &tls.Config{
+			ServerName:         parent.Hostname(),
+			InsecureSkipVerify: true, // Matches the HTTP transport used by this proxy.
+		})
+	default:
+		return nil, fmt.Errorf("unsupported parent proxy scheme %q", parent.Scheme)
+	}
+}
+
+func relayTunnel(clientConn net.Conn, clientReader io.Reader, upConn net.Conn, upReader io.Reader, logger *log.Logger) error {
+	type copyResult struct {
+		direction string
+		err       error
+	}
+	results := make(chan copyResult, 2)
+	copyStream := func(direction string, dst net.Conn, src io.Reader) {
+		_, err := io.Copy(dst, src)
+		if closeWriter, ok := dst.(interface{ CloseWrite() error }); ok {
+			// Best effort: preserve half-close semantics without turning a normal
+			// peer shutdown into a tunnel failure.
+			_ = closeWriter.CloseWrite()
+		}
+		results <- copyResult{direction: direction, err: err}
+	}
+
+	go copyStream("client to parent", upConn, clientReader)
+	go copyStream("parent to client", clientConn, upReader)
+
+	first := <-results
+	if first.err != nil && !errors.Is(first.err, net.ErrClosed) {
+		clientConn.Close()
+		upConn.Close()
+	}
+	second := <-results
+
+	for _, result := range []copyResult{first, second} {
+		if result.err != nil && !errors.Is(result.err, net.ErrClosed) {
+			logger.Printf("FAILED tunnel copy %s: %v", result.direction, result.err)
+			return fmt.Errorf("copy %s: %w", result.direction, result.err)
+		}
+	}
 	return nil
 }
 
