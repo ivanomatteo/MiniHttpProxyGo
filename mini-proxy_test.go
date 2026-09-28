@@ -276,3 +276,119 @@ func TestLoadConfigStopIfAuthFail(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadConfigAcceptConnectionFrom(t *testing.T) {
+	tests := []struct {
+		name    string
+		json    string
+		want    []string
+		wantErr bool
+	}{
+		{name: "defaults to loopback", json: `{}`, want: []string{"127.0.0.1", "::1"}},
+		{name: "explicit list", json: `{"accept_connection_from":["192.168.1.1","192.168.20.0/24"]}`, want: []string{"192.168.1.1", "192.168.20.0/24"}},
+		{name: "empty list", json: `{"accept_connection_from":[]}`, wantErr: true},
+		{name: "invalid ip", json: `{"accept_connection_from":["192.168.1.300"]}`, wantErr: true},
+		{name: "invalid cidr", json: `{"accept_connection_from":["10.0.0.0/33"]}`, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(tt.json), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := loadConfig(path)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("loadConfig() error = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Join(cfg.AcceptConnectionFrom, ",") != strings.Join(tt.want, ",") {
+				t.Fatalf("AcceptConnectionFrom = %v, want %v", cfg.AcceptConnectionFrom, tt.want)
+			}
+			if len(cfg.allowedSources) != len(tt.want) {
+				t.Fatalf("allowedSources = %v, want %d entries", cfg.allowedSources, len(tt.want))
+			}
+		})
+	}
+}
+
+func TestIsSourceAllowed(t *testing.T) {
+	allowed, err := parseAllowedSources([]string{"192.168.1.1", "192.168.20.0/24", "::1", "::ffff:10.0.0.0/104"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		addr string
+		want bool
+	}{
+		{addr: "192.168.1.1:5000", want: true},
+		{addr: "192.168.1.2:5000", want: false},
+		{addr: "192.168.20.254:5000", want: true},
+		{addr: "192.168.21.1:5000", want: false},
+		{addr: "[::1]:5000", want: true},
+		{addr: "[::ffff:192.168.20.10]:5000", want: true},
+		{addr: "10.1.2.3:5000", want: true},
+		{addr: "127.0.0.1:5000", want: false},
+		{addr: "[fe80::1%eth0]:5000", want: false},
+	}
+	for _, tt := range tests {
+		addr, err := net.ResolveTCPAddr("tcp", tt.addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := isSourceAllowed(addr, allowed); got != tt.want {
+			t.Errorf("isSourceAllowed(%s) = %v, want %v", tt.addr, got, tt.want)
+		}
+	}
+}
+
+func TestSourceFilterListenerRejectsDisallowedSources(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	allowed, err := parseAllowedSources([]string{"192.168.1.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	filtered := &sourceFilterListener{Listener: ln, allowed: allowed, logger: log.New(&logs, "", 0)}
+
+	accepted := make(chan net.Conn, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := filtered.Accept()
+		if err == nil {
+			accepted <- conn
+		}
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("read succeeded, want rejected connection to be closed")
+	}
+	// Closing the listener unblocks Accept, so the log buffer can be read safely.
+	ln.Close()
+	<-done
+	select {
+	case c := <-accepted:
+		c.Close()
+		t.Fatal("disallowed connection was accepted")
+	default:
+	}
+	if !strings.Contains(logs.String(), "REJECTED 127.0.0.1:") {
+		t.Fatalf("log = %q, want REJECTED entry", logs.String())
+	}
+}

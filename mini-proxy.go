@@ -17,6 +17,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -38,6 +39,10 @@ type Config struct {
 	BlockedHosts   []string `json:"blocked_hosts"`     // hosts to block (exact or suffix)
 	Debug          bool     `json:"debug"`             // enable debug logging (e.g. client process ID)
 	StopIfAuthFail bool     `json:"stop_if_auth_fail"` // stop when the parent proxy returns HTTP 407
+	// source IPs or CIDR ranges allowed to connect, e.g. ["127.0.0.1", "192.168.20.0/24"]
+	AcceptConnectionFrom []string `json:"accept_connection_from"`
+
+	allowedSources []netip.Prefix
 }
 
 type encryptedPassword struct {
@@ -197,6 +202,12 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 		logger.Printf("PROXIED %s%s %s %s -> %d in %s", clientIP, procInfo, r.Method, r.URL.String(), resp.StatusCode, time.Since(start))
 	}
 
+	listener, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err)
+	}
+	listener = &sourceFilterListener{Listener: listener, allowed: cfg.allowedSources, logger: logger}
+
 	httpServer := &http.Server{
 		Addr:    cfg.ListenAddr,
 		Handler: http.HandlerFunc(handler),
@@ -226,15 +237,19 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 		httpServer.Shutdown(ctx)
 	}()
 
-	logger.Printf("Starting mini proxy on %s, forwarding to %s", cfg.ListenAddr, cfg.ParentProxy)
-	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
+	logger.Printf("Starting mini proxy on %s, forwarding to %s, accepting connections from %s",
+		cfg.ListenAddr, cfg.ParentProxy, strings.Join(cfg.AcceptConnectionFrom, ", "))
+	if err := httpServer.Serve(listener); err != http.ErrServerClosed {
 		return fmt.Errorf("server error: %w", err)
 	}
 	return nil
 }
 
 func loadConfig(cfgPath string) (Config, error) {
-	cfg := Config{StopIfAuthFail: true}
+	cfg := Config{
+		StopIfAuthFail:       true,
+		AcceptConnectionFrom: []string{"127.0.0.1", "::1"},
+	}
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		return cfg, fmt.Errorf("open config: %w", err)
@@ -288,6 +303,11 @@ func loadConfig(cfgPath string) (Config, error) {
 	decodeData, _ := json.Marshal(configForDecode)
 	if err := json.Unmarshal(decodeData, &cfg); err != nil {
 		return cfg, fmt.Errorf("decode config: %w", err)
+	}
+
+	cfg.allowedSources, err = parseAllowedSources(cfg.AcceptConnectionFrom)
+	if err != nil {
+		return cfg, fmt.Errorf("accept_connection_from: %w", err)
 	}
 
 	needsWrite := seedAdded
@@ -455,6 +475,73 @@ func resolveCredentials(cfg *Config, serviceMode bool, input io.Reader, output i
 		}
 	}
 	return nil
+}
+
+// parseAllowedSources converts IP addresses and CIDR ranges into prefixes.
+// A single IP is treated as a host prefix (/32 for IPv4, /128 for IPv6).
+func parseAllowedSources(entries []string) ([]netip.Prefix, error) {
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("at least one IP address or CIDR range is required")
+	}
+	prefixes := make([]netip.Prefix, 0, len(entries))
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if strings.Contains(entry, "/") {
+			prefix, err := netip.ParsePrefix(entry)
+			if err != nil {
+				return nil, fmt.Errorf("invalid CIDR range %q", entry)
+			}
+			if prefix.Addr().Is4In6() && prefix.Bits() >= 96 {
+				prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
+			}
+			prefixes = append(prefixes, prefix.Masked())
+			continue
+		}
+		addr, err := netip.ParseAddr(entry)
+		if err != nil {
+			return nil, fmt.Errorf("invalid IP address %q", entry)
+		}
+		addr = addr.Unmap()
+		prefixes = append(prefixes, netip.PrefixFrom(addr, addr.BitLen()))
+	}
+	return prefixes, nil
+}
+
+func isSourceAllowed(remoteAddr net.Addr, allowed []netip.Prefix) bool {
+	addrPort, err := netip.ParseAddrPort(remoteAddr.String())
+	if err != nil {
+		return false
+	}
+	// IPv4 clients on a dual-stack listener appear as ::ffff:a.b.c.d.
+	addr := addrPort.Addr().Unmap().WithZone("")
+	for _, prefix := range allowed {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// sourceFilterListener closes connections whose source IP is not allowed
+// before any request data is read.
+type sourceFilterListener struct {
+	net.Listener
+	allowed []netip.Prefix
+	logger  *log.Logger
+}
+
+func (l *sourceFilterListener) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if isSourceAllowed(conn.RemoteAddr(), l.allowed) {
+			return conn, nil
+		}
+		l.logger.Printf("REJECTED %s: source address not allowed", conn.RemoteAddr())
+		conn.Close()
+	}
 }
 
 func isBlocked(host string, blocked []string) bool {

@@ -5,6 +5,7 @@ A lightweight HTTP/HTTPS proxy written in Go. It supports parent proxy forwardin
 ## Features
 - **Parent Proxy Forwarding**: Forward requests to another HTTP/HTTPS proxy.
 - **Authentication**: Supports Basic Auth for the parent proxy.
+- **Source IP Filtering**: Accept client connections only from allowed IP addresses or CIDR ranges (loopback only by default).
 - **Host Blacklisting**: Block specific domains or suffixes (e.g., `facebook.com`, `ads.example.com`).
 - **Process Identification (Debug Mode)**: On Linux and Windows, identifies which local process is making the request.
 - **Service Integration**: Fully compatible with Systemd (Linux) and Service Control Manager (Windows).
@@ -18,7 +19,8 @@ Create a `config.json` file (see `sample-config.json`):
 
 ```json
 {
-  "listen_addr": ":3128",
+  "listen_addr": "127.0.0.1:3128",
+  "accept_connection_from": ["127.0.0.1", "::1"],
   "parent_proxy": "http://proxy.example.com:8080",
   "username": "your_user",
   "password": "your_password",
@@ -33,6 +35,7 @@ Create a `config.json` file (see `sample-config.json`):
 | Field | Description |
 |-------|-------------|
 | `listen_addr` | Address and port to listen on (e.g., `:3128`). |
+| `accept_connection_from` | Array of source IP addresses and CIDR ranges allowed to connect (e.g., `["192.168.1.1", "192.168.20.0/24"]`). Defaults to `["127.0.0.1", "::1"]` when omitted. |
 | `parent_proxy` | URL of the upstream proxy. |
 | `username` | Username for parent proxy authentication. Leave empty to omit it, set to `[ask]` to request it at console startup, or provide a fixed value. |
 | `password` | Password for parent proxy authentication. Leave empty to omit it, set to `[ask]` to request it at console startup, or provide a fixed value. |
@@ -45,6 +48,14 @@ Create a `config.json` file (see `sample-config.json`):
 Authentication is disabled when both `username` and `password` are empty. In console mode, each field set to `[ask]` is requested interactively at startup; password input is hidden and credentials are never written to the log. The `[ask]` value is not supported in service mode: startup fails with an error, because a service has no interactive console. Configure fixed credentials (or leave both fields empty) before installing or starting the service.
 
 When `password` is a non-empty plain string, the proxy encrypts it at startup and atomically rewrites the configuration as `{"encrypted":"..."}`. Existing encrypted values are decrypted only in memory. Encryption uses AES-GCM and a key derived from `SHA1(SHA1(key_seed) + username)`; changing either `key_seed` or `username` makes an existing encrypted password unreadable. Empty passwords and `[ask]` remain strings because they are control values rather than stored secrets.
+
+### Source IP Filtering
+Every incoming connection is checked against `accept_connection_from` as soon as it is accepted, before any request data is read. Connections from other addresses are closed immediately and logged as `REJECTED`.
+
+- Each entry is either a single IP address (IPv4 or IPv6) or a CIDR range such as `192.168.20.0/24` or `fd00::/8`.
+- When the field is omitted, only loopback clients (`127.0.0.1` and `::1`) are accepted. Remember to add the addresses of other hosts when `listen_addr` is not bound to loopback only (e.g. `:3128`).
+- IPv4 clients reaching a dual-stack listener as IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are matched against the IPv4 entries.
+- An empty array or an invalid entry is a configuration error and prevents startup. To accept any source explicitly, use `["0.0.0.0/0", "::/0"]`.
 
 ## Debug Mode: Process Identification
 When `debug` is set to `true`, the proxy attempts to identify the local process initiating the request.
