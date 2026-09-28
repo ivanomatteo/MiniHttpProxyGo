@@ -22,7 +22,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -41,8 +43,26 @@ type Config struct {
 	StopIfAuthFail bool     `json:"stop_if_auth_fail"` // stop when the parent proxy returns HTTP 407
 	// source IPs or CIDR ranges allowed to connect, e.g. ["127.0.0.1", "192.168.20.0/24"]
 	AcceptConnectionFrom []string `json:"accept_connection_from"`
+	// TCP ports forwarded directly to a fixed destination, without the parent proxy
+	TCPTunnels []TCPTunnel `json:"tcp_tunnel"`
+	// source IPs or CIDR ranges allowed to connect to the TCP tunnels
+	AcceptTCPConnectionFrom []string `json:"accept_tcp_connection_from"`
 
-	allowedSources []netip.Prefix
+	allowedSources    []netip.Prefix
+	allowedTCPSources []netip.Prefix
+}
+
+// TCPTunnel forwards every connection accepted on SourceAddr directly to
+// TargetHost:TargetPort. It is independent of the HTTP proxy and never uses
+// the parent proxy.
+type TCPTunnel struct {
+	SourceAddr string `json:"source_addr"` // e.g. "127.0.0.1:2222"
+	TargetHost string `json:"target_host"` // e.g. "10.0.0.10"
+	TargetPort int    `json:"target_port"` // e.g. 22
+}
+
+func (t TCPTunnel) target() string {
+	return net.JoinHostPort(t.TargetHost, strconv.Itoa(t.TargetPort))
 }
 
 type encryptedPassword struct {
@@ -107,6 +127,24 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 	}
 	listener = &sourceFilterListener{Listener: listener, allowed: cfg.allowedSources, logger: logger}
 
+	tunnels := make([]*tcpTunnelServer, 0, len(cfg.TCPTunnels))
+	closeTunnels := func() {
+		for _, tunnel := range tunnels {
+			tunnel.Close()
+		}
+	}
+	defer closeTunnels()
+	for _, tunnelCfg := range cfg.TCPTunnels {
+		tunnelListener, err := net.Listen("tcp", tunnelCfg.SourceAddr)
+		if err != nil {
+			listener.Close()
+			return fmt.Errorf("tcp_tunnel: listen on %s: %w", tunnelCfg.SourceAddr, err)
+		}
+		tunnels = append(tunnels, newTCPTunnelServer(tunnelCfg,
+			&sourceFilterListener{Listener: tunnelListener, allowed: cfg.allowedTCPSources, logger: logger},
+			logger, cfg.Debug))
+	}
+
 	httpServer := &http.Server{
 		Addr:    cfg.ListenAddr,
 		Handler: proxy,
@@ -134,8 +172,10 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 		}()
 	}
 
+	stopped := make(chan struct{})
 	go func() {
 		<-stopChan
+		close(stopped)
 		logger.Printf("Shutting down server...")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -144,8 +184,19 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 
 	logger.Printf("Starting mini proxy on %s, forwarding to %s, accepting connections from %s",
 		cfg.ListenAddr, cfg.ParentProxy, strings.Join(cfg.AcceptConnectionFrom, ", "))
+	for _, tunnel := range tunnels {
+		logger.Printf("Starting TCP tunnel on %s, forwarding directly to %s, accepting connections from %s",
+			tunnel.cfg.SourceAddr, tunnel.cfg.target(), strings.Join(cfg.AcceptTCPConnectionFrom, ", "))
+		go tunnel.Serve()
+	}
 	if err := httpServer.Serve(listener); err != http.ErrServerClosed {
 		return fmt.Errorf("server error: %w", err)
+	}
+	// TCP tunnels do not use the parent proxy, so a parent authentication
+	// failure leaves them running until the service is stopped.
+	if proxy.authFailed.Load() && len(tunnels) > 0 {
+		logger.Printf("HTTP proxy stopped; TCP tunnels keep running until shutdown")
+		<-stopped
 	}
 	return nil
 }
@@ -294,8 +345,9 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func loadConfig(cfgPath string) (Config, error) {
 	cfg := Config{
-		StopIfAuthFail:       true,
-		AcceptConnectionFrom: []string{"127.0.0.1", "::1"},
+		StopIfAuthFail:          true,
+		AcceptConnectionFrom:    []string{"127.0.0.1", "::1"},
+		AcceptTCPConnectionFrom: []string{"127.0.0.1", "::1"},
 	}
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
@@ -355,6 +407,13 @@ func loadConfig(cfgPath string) (Config, error) {
 	cfg.allowedSources, err = parseAllowedSources(cfg.AcceptConnectionFrom)
 	if err != nil {
 		return cfg, fmt.Errorf("accept_connection_from: %w", err)
+	}
+	cfg.allowedTCPSources, err = parseAllowedSources(cfg.AcceptTCPConnectionFrom)
+	if err != nil {
+		return cfg, fmt.Errorf("accept_tcp_connection_from: %w", err)
+	}
+	if err := validateTCPTunnels(cfg.TCPTunnels); err != nil {
+		return cfg, fmt.Errorf("tcp_tunnel: %w", err)
 	}
 
 	needsWrite := seedAdded
@@ -613,60 +672,27 @@ func isBlocked(host string, blocked []string) bool {
 // handleConnect sends a CONNECT to the parent proxy (with Proxy-Authorization if provided) and then tunnels the TCP streams.
 var errParentProxyAuthentication = errors.New("parent proxy authentication required or rejected")
 
+var errParentConnectRefused = errors.New("parent proxy refused CONNECT")
+
 func handleConnect(w http.ResponseWriter, r *http.Request, parent *url.URL, proxyAuth string, logger *log.Logger) error {
-	upConn, err := dialParentProxy(parent)
+	upConn, upReader, err := connectThroughParent(parent, proxyAuth, r.Host)
 	if err != nil {
-		http.Error(w, "Bad Gateway", http.StatusBadGateway)
-		return fmt.Errorf("dial parent: %w", err)
+		w.WriteHeader(http.StatusBadGateway)
+		switch {
+		case errors.Is(err, errParentProxyAuthentication):
+			w.Write([]byte("Parent proxy authentication failed\n"))
+		case errors.Is(err, errParentConnectRefused):
+			w.Write([]byte("Parent proxy refused CONNECT\n"))
+		default:
+			w.Write([]byte("Bad Gateway\n"))
+		}
+		return err
 	}
 	defer upConn.Close()
-	if err := upConn.SetDeadline(time.Now().Add(connectTimeout)); err != nil {
-		http.Error(w, "Bad Gateway", http.StatusBadGateway)
-		return fmt.Errorf("set parent CONNECT deadline: %w", err)
-	}
-
-	// send CONNECT request to parent
-	target := r.Host
-	reqLines := []string{fmt.Sprintf("CONNECT %s HTTP/1.1", target), fmt.Sprintf("Host: %s", target)}
-	if proxyAuth != "" {
-		reqLines = append(reqLines, fmt.Sprintf("Proxy-Authorization: %s", proxyAuth))
-	}
-	reqLines = append(reqLines, "\r\n")
-	connectReq := strings.Join(reqLines, "\r\n")
-	if _, err := upConn.Write([]byte(connectReq)); err != nil {
-		http.Error(w, "Bad Gateway", http.StatusBadGateway)
-		return fmt.Errorf("write CONNECT to parent: %w", err)
-	}
-
-	// Parse the complete HTTP response without consuming any bytes belonging to
-	// the tunneled connection that may already have arrived after its headers.
-	upReader := bufio.NewReader(upConn)
-	connectResponse, err := http.ReadResponse(upReader, &http.Request{Method: http.MethodConnect})
-	if err != nil {
-		http.Error(w, "Bad Gateway", http.StatusBadGateway)
-		return fmt.Errorf("read CONNECT response: %w", err)
-	}
-	if connectResponse.StatusCode == http.StatusProxyAuthRequired {
-		connectResponse.Body.Close()
-		w.WriteHeader(http.StatusBadGateway)
-		w.Write([]byte("Parent proxy authentication failed\n"))
-		return fmt.Errorf("%w: %s", errParentProxyAuthentication, connectResponse.Status)
-	}
-	if connectResponse.StatusCode < 200 || connectResponse.StatusCode >= 300 {
-		connectResponse.Body.Close()
-		w.WriteHeader(http.StatusBadGateway)
-		w.Write([]byte("Parent proxy refused CONNECT\n"))
-		return fmt.Errorf("parent CONNECT failed: %s", connectResponse.Status)
-	}
-	if err := upConn.SetDeadline(time.Time{}); err != nil {
-		http.Error(w, "Bad Gateway", http.StatusBadGateway)
-		return fmt.Errorf("clear parent CONNECT deadline: %w", err)
-	}
 
 	// Hijack client connection
 	hj, ok := w.(http.Hijacker)
 	if !ok {
-		upConn.Close()
 		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
 		return fmt.Errorf("hijack not supported")
 	}
@@ -689,6 +715,54 @@ func handleConnect(w http.ResponseWriter, r *http.Request, parent *url.URL, prox
 	// parsing CONNECT. Dropping either buffer can lose a TLS ClientHello or the
 	// first bytes returned by the destination.
 	return relayTunnel(clientConn, clientRW.Reader, upConn, upReader, logger)
+}
+
+// connectThroughParent opens a CONNECT tunnel to target on the parent proxy.
+// The returned reader holds any tunneled bytes that arrived together with the
+// CONNECT response and must be used to read from the connection.
+func connectThroughParent(parent *url.URL, proxyAuth, target string) (net.Conn, *bufio.Reader, error) {
+	upConn, err := dialParentProxy(parent)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dial parent: %w", err)
+	}
+	fail := func(err error) (net.Conn, *bufio.Reader, error) {
+		upConn.Close()
+		return nil, nil, err
+	}
+	if err := upConn.SetDeadline(time.Now().Add(connectTimeout)); err != nil {
+		return fail(fmt.Errorf("set parent CONNECT deadline: %w", err))
+	}
+
+	// send CONNECT request to parent
+	reqLines := []string{fmt.Sprintf("CONNECT %s HTTP/1.1", target), fmt.Sprintf("Host: %s", target)}
+	if proxyAuth != "" {
+		reqLines = append(reqLines, fmt.Sprintf("Proxy-Authorization: %s", proxyAuth))
+	}
+	reqLines = append(reqLines, "\r\n")
+	connectReq := strings.Join(reqLines, "\r\n")
+	if _, err := upConn.Write([]byte(connectReq)); err != nil {
+		return fail(fmt.Errorf("write CONNECT to parent: %w", err))
+	}
+
+	// Parse the complete HTTP response without consuming any bytes belonging to
+	// the tunneled connection that may already have arrived after its headers.
+	upReader := bufio.NewReader(upConn)
+	connectResponse, err := http.ReadResponse(upReader, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		return fail(fmt.Errorf("read CONNECT response: %w", err))
+	}
+	if connectResponse.StatusCode == http.StatusProxyAuthRequired {
+		connectResponse.Body.Close()
+		return fail(fmt.Errorf("%w: %s", errParentProxyAuthentication, connectResponse.Status))
+	}
+	if connectResponse.StatusCode < 200 || connectResponse.StatusCode >= 300 {
+		connectResponse.Body.Close()
+		return fail(fmt.Errorf("%w: %s", errParentConnectRefused, connectResponse.Status))
+	}
+	if err := upConn.SetDeadline(time.Time{}); err != nil {
+		return fail(fmt.Errorf("clear parent CONNECT deadline: %w", err))
+	}
+	return upConn, upReader, nil
 }
 
 func dialParentProxy(parent *url.URL) (net.Conn, error) {
@@ -755,4 +829,119 @@ func parentConnectStatusError(statusLine string) error {
 		return fmt.Errorf("%w: %s", errParentProxyAuthentication, statusLine)
 	}
 	return nil
+}
+
+func validateTCPTunnels(tunnels []TCPTunnel) error {
+	for i, tunnel := range tunnels {
+		if _, _, err := net.SplitHostPort(tunnel.SourceAddr); err != nil {
+			return fmt.Errorf("entry %d: invalid source_addr %q: %v", i, tunnel.SourceAddr, err)
+		}
+		if strings.TrimSpace(tunnel.TargetHost) == "" {
+			return fmt.Errorf("entry %d: target_host is required", i)
+		}
+		if tunnel.TargetPort < 1 || tunnel.TargetPort > 65535 {
+			return fmt.Errorf("entry %d: target_port %d out of range 1-65535", i, tunnel.TargetPort)
+		}
+	}
+	return nil
+}
+
+// tcpTunnelServer accepts connections on a local address and relays each one
+// directly to a fixed target.
+type tcpTunnelServer struct {
+	cfg      TCPTunnel
+	listener net.Listener
+	logger   *log.Logger
+	debug    bool
+
+	mu     sync.Mutex
+	closed bool
+	conns  map[net.Conn]struct{}
+}
+
+func newTCPTunnelServer(cfg TCPTunnel, listener net.Listener, logger *log.Logger, debug bool) *tcpTunnelServer {
+	return &tcpTunnelServer{cfg: cfg, listener: listener, logger: logger, debug: debug, conns: make(map[net.Conn]struct{})}
+}
+
+func (t *tcpTunnelServer) Serve() {
+	for {
+		conn, err := t.listener.Accept()
+		if err != nil {
+			if !errors.Is(err, net.ErrClosed) {
+				t.logger.Printf("FAILED accepting TCP tunnel connection on %s: %v", t.cfg.SourceAddr, err)
+			}
+			return
+		}
+		if !t.track(conn) {
+			conn.Close()
+			return
+		}
+		go func() {
+			defer t.untrack(conn)
+			t.handle(conn)
+		}()
+	}
+}
+
+// Close stops accepting connections and closes the active ones.
+func (t *tcpTunnelServer) Close() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return
+	}
+	t.closed = true
+	t.listener.Close()
+	for conn := range t.conns {
+		conn.Close()
+	}
+}
+
+func (t *tcpTunnelServer) track(conn net.Conn) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return false
+	}
+	t.conns[conn] = struct{}{}
+	return true
+}
+
+func (t *tcpTunnelServer) untrack(conn net.Conn) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.conns, conn)
+	conn.Close()
+}
+
+func (t *tcpTunnelServer) handle(clientConn net.Conn) {
+	start := time.Now()
+	clientIP := clientConn.RemoteAddr().String()
+	target := t.cfg.target()
+
+	procInfo := ""
+	if t.debug {
+		procInfo = identifyProcess(clientIP)
+		if procInfo != "" {
+			procInfo = " [" + procInfo + "]"
+		}
+	}
+
+	dialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
+	upConn, err := dialer.Dial("tcp", target)
+	if err != nil {
+		t.logger.Printf("FAILED TCP tunnel %s%s %s -> %s: %v", clientIP, procInfo, t.cfg.SourceAddr, target, err)
+		return
+	}
+	if !t.track(upConn) {
+		upConn.Close()
+		return
+	}
+	defer t.untrack(upConn)
+
+	if err := relayTunnel(clientConn, clientConn, upConn, upConn, t.logger); err != nil {
+		t.logger.Printf("FAILED TCP tunnel %s%s %s -> %s: %v", clientIP, procInfo, t.cfg.SourceAddr, target, err)
+		return
+	}
+	t.logger.Printf("TUNNELED %s%s TCP %s -> %s in %s", clientIP, procInfo, t.cfg.SourceAddr, target, time.Since(start))
 }

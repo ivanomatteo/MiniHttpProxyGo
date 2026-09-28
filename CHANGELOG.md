@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Add the `tcp_tunnel` configuration option: an array of direct TCP port forwards (e.g. `[{"source_addr":"127.0.0.1:2222","target_host":"10.0.0.10","target_port":22}]`). Each entry listens on `source_addr` and connects every accepted connection directly to the target, like `ssh -L`. Tunnels are independent of the HTTP proxy: they do not use the parent proxy, and `blocked_hosts` and `stop_if_auth_fail` do not apply to them. No tunnel is active when the option is omitted or empty.
+- Add the `accept_tcp_connection_from` configuration option: source IP addresses and CIDR ranges allowed to connect to the TCP tunnels, separate from `accept_connection_from`. Defaults to loopback only (`127.0.0.1` and `::1`).
 - Add the `accept_connection_from` configuration option: an array of source IP addresses and CIDR ranges (e.g. `["192.168.1.1", "192.168.20.0/24"]`) allowed to connect to the proxy. Connections from any other address are closed as soon as they are accepted and logged as `REJECTED`.
 - Support plain `ws://` WebSockets and other HTTP `Upgrade` protocols sent to the proxy as regular requests. `wss://` continues to use `CONNECT` tunnels.
 

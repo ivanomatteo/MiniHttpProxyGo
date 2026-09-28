@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -569,5 +570,152 @@ func TestProxyStopsAfterParentAuthenticationFailure(t *testing.T) {
 	}
 	if got := failures.Load(); got != 1 {
 		t.Fatalf("onAuthFailure called %d times, want 1", got)
+	}
+}
+
+// startTunnelTestTarget runs a TCP server that echoes every line prefixed
+// with "echo " and returns its address.
+func startTunnelTestTarget(t *testing.T) *net.TCPAddr {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				reader := bufio.NewReader(conn)
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						return
+					}
+					fmt.Fprintf(conn, "echo %s", line)
+				}
+			}()
+		}
+	}()
+	return listener.Addr().(*net.TCPAddr)
+}
+
+func startTestTunnel(t *testing.T, target *net.TCPAddr, allowed []netip.Prefix) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := TCPTunnel{SourceAddr: listener.Addr().String(), TargetHost: target.IP.String(), TargetPort: target.Port}
+	logger := log.New(io.Discard, "", 0)
+	tunnel := newTCPTunnelServer(cfg, &sourceFilterListener{Listener: listener, allowed: allowed, logger: logger}, logger, false)
+	go tunnel.Serve()
+	t.Cleanup(tunnel.Close)
+	return cfg.SourceAddr
+}
+
+func TestTCPTunnelRelaysDirectlyToTarget(t *testing.T) {
+	addr := startTestTunnel(t, startTunnelTestTarget(t), []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")})
+
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	io.WriteString(conn, "hello\n")
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line != "echo hello\n" {
+		t.Fatalf("tunnel returned %q, want %q", line, "echo hello\n")
+	}
+}
+
+func TestTCPTunnelRejectsDisallowedSources(t *testing.T) {
+	addr := startTestTunnel(t, startTunnelTestTarget(t), []netip.Prefix{netip.MustParsePrefix("192.0.2.1/32")})
+
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	io.WriteString(conn, "hello\n")
+	if _, err := bufio.NewReader(conn).ReadString('\n'); err == nil {
+		t.Fatal("connection from a disallowed source was relayed")
+	}
+}
+
+func TestLoadConfigAcceptTCPConnectionFrom(t *testing.T) {
+	tests := []struct {
+		name    string
+		json    string
+		want    []string
+		wantErr bool
+	}{
+		{name: "defaults to loopback", json: `{}`, want: []string{"127.0.0.1", "::1"}},
+		{name: "independent of accept_connection_from", json: `{"accept_connection_from":["10.0.0.1"]}`, want: []string{"127.0.0.1", "::1"}},
+		{name: "explicit list", json: `{"accept_tcp_connection_from":["192.168.20.0/24"]}`, want: []string{"192.168.20.0/24"}},
+		{name: "empty list", json: `{"accept_tcp_connection_from":[]}`, wantErr: true},
+		{name: "invalid entry", json: `{"accept_tcp_connection_from":["not-an-ip"]}`, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(tt.json), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := loadConfig(path)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("loadConfig() error = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Join(cfg.AcceptTCPConnectionFrom, ",") != strings.Join(tt.want, ",") {
+				t.Fatalf("AcceptTCPConnectionFrom = %v, want %v", cfg.AcceptTCPConnectionFrom, tt.want)
+			}
+			if len(cfg.allowedTCPSources) != len(tt.want) {
+				t.Fatalf("allowedTCPSources = %v, want %d entries", cfg.allowedTCPSources, len(tt.want))
+			}
+		})
+	}
+}
+
+func TestLoadConfigTCPTunnel(t *testing.T) {
+	tests := []struct {
+		name    string
+		tunnels string
+		wantErr bool
+	}{
+		{name: "omitted", tunnels: ""},
+		{name: "empty", tunnels: `,"tcp_tunnel":[]`},
+		{name: "valid", tunnels: `,"tcp_tunnel":[{"source_addr":"127.0.0.1:2222","target_host":"10.0.0.10","target_port":22}]`},
+		{name: "missing port in source", tunnels: `,"tcp_tunnel":[{"source_addr":"127.0.0.1","target_host":"10.0.0.10","target_port":22}]`, wantErr: true},
+		{name: "missing target host", tunnels: `,"tcp_tunnel":[{"source_addr":":2222","target_port":22}]`, wantErr: true},
+		{name: "invalid target port", tunnels: `,"tcp_tunnel":[{"source_addr":":2222","target_host":"10.0.0.10","target_port":0}]`, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			data := `{"key_seed":"seed","listen_addr":":0","parent_proxy":"http://proxy.test:3128"` + tt.tunnels + `}`
+			if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := loadConfig(path)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("loadConfig() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
 	}
 }

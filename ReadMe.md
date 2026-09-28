@@ -29,7 +29,11 @@ Create a `config.json` file (see `sample-config.json`):
   "log_file": "proxy.log",
   "blocked_hosts": ["facebook.com", "ads.example.com"],
   "debug": true,
-  "stop_if_auth_fail": true
+  "stop_if_auth_fail": true,
+  "tcp_tunnel": [
+    {"source_addr": "127.0.0.1:2222", "target_host": "10.0.0.10", "target_port": 22}
+  ],
+  "accept_tcp_connection_from": ["127.0.0.1", "::1"]
 }
 ```
 
@@ -46,6 +50,8 @@ Create a `config.json` file (see `sample-config.json`):
 | `blocked_hosts` | Array of domains to block. An entry blocks the domain itself and all of its subdomains, on any port (e.g. `example.com` blocks `example.com:443` and `www.example.com`, but not `notexample.com`). |
 | `debug` | Enable extended logging, including process identification for local requests. |
 | `stop_if_auth_fail` | Stop accepting connections when the parent proxy returns HTTP 407. The request that received the 407 still gets its response; requests already in progress get up to 5 seconds to complete. Defaults to `true`; set to `false` to keep forwarding requests. |
+| `tcp_tunnel` | Array of direct TCP port forwards, independent of the proxy (see [TCP Tunnels](#tcp-tunnels)). Omit it or leave it empty to disable tunnels. |
+| `accept_tcp_connection_from` | Array of source IP addresses and CIDR ranges allowed to connect to the TCP tunnels, with the same syntax as `accept_connection_from`. Defaults to `["127.0.0.1", "::1"]` when omitted. |
 
 Authentication is disabled when both `username` and `password` are empty. In console mode, each field set to `[ask]` is requested interactively at startup; password input is hidden and credentials are never written to the log. The `[ask]` value is not supported in service mode: startup fails with an error, because a service has no interactive console. Configure fixed credentials (or leave both fields empty) before installing or starting the service.
 
@@ -58,6 +64,21 @@ Every incoming connection is checked against `accept_connection_from` as soon as
 - When the field is omitted, only loopback clients (`127.0.0.1` and `::1`) are accepted. Remember to add the addresses of other hosts when `listen_addr` is not bound to loopback only (e.g. `:3128`).
 - IPv4 clients reaching a dual-stack listener as IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are matched against the IPv4 entries.
 - An empty array or an invalid entry is a configuration error and prevents startup. To accept any source explicitly, use `["0.0.0.0/0", "::/0"]`.
+
+### TCP Tunnels
+Each `tcp_tunnel` entry is a plain port forward, like `ssh -L` or a netcat relay: the program listens on `source_addr` and connects every accepted connection directly to `target_host:target_port`. Tunnels are independent of the HTTP proxy: they never use the parent proxy or its credentials.
+
+| Field | Description |
+|-------|-------------|
+| `source_addr` | Local address and port to listen on. Like `listen_addr`, the host part selects the interface to bind (`127.0.0.1:2222` for loopback only, `:2222` for all interfaces). |
+| `target_host` | Destination host name or IP address, resolved locally. |
+| `target_port` | Destination port (1-65535). |
+
+With the example configuration above, `ssh -p 2222 user@127.0.0.1` reaches the SSH server on `10.0.0.10:22`.
+
+- Connections are filtered by `accept_tcp_connection_from`, checked the same way as `accept_connection_from` for the proxy. The two lists are independent.
+- `blocked_hosts` and `stop_if_auth_fail` apply only to the HTTP proxy. When the proxy stops after a parent `407`, the tunnels keep running until the program is stopped.
+- An invalid entry, or a `source_addr` that cannot be bound, prevents startup.
 
 ## Debug Mode: Process Identification
 When `debug` is set to `true`, the proxy attempts to identify the local process initiating the request.
