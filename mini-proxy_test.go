@@ -5,16 +5,19 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -390,5 +393,181 @@ func TestSourceFilterListenerRejectsDisallowedSources(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "REJECTED 127.0.0.1:") {
 		t.Fatalf("log = %q, want REJECTED entry", logs.String())
+	}
+}
+
+func TestIsBlocked(t *testing.T) {
+	blocked := []string{"facebook.com", "Ads.Example.com."}
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{host: "facebook.com", want: true},
+		{host: "facebook.com:443", want: true},
+		{host: "www.facebook.com:8080", want: true},
+		{host: "FACEBOOK.COM.", want: true},
+		{host: "ads.example.com", want: true},
+		{host: "x.ads.example.com:80", want: true},
+		{host: "notfacebook.com", want: false},
+		{host: "facebook.com.evil.test", want: false},
+		{host: "example.com", want: false},
+		{host: "[::1]:443", want: false},
+	}
+	for _, tt := range tests {
+		if got := isBlocked(tt.host, blocked); got != tt.want {
+			t.Errorf("isBlocked(%q) = %v, want %v", tt.host, got, tt.want)
+		}
+	}
+}
+
+const testParentAuth = "Basic dXNlcjpwYXNz" // user:pass
+
+// newForwardingTestProxy starts a target server, a parent proxy requiring
+// user:pass and the mini proxy configured with the given credentials.
+func newForwardingTestProxy(t *testing.T, username, password string) (target *httptest.Server, proxy *proxyServer, proxyURL *url.URL) {
+	t.Helper()
+	target = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/redirect":
+			http.Redirect(w, r, "/final", http.StatusFound)
+		case "/ws":
+			if r.Header.Get("Upgrade") != "websocket" {
+				http.Error(w, "upgrade required", http.StatusUpgradeRequired)
+				return
+			}
+			conn, rw, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+			rw.Flush()
+			line, err := rw.ReadString('\n')
+			if err != nil {
+				return
+			}
+			rw.WriteString("echo " + line)
+			rw.Flush()
+		default:
+			w.Header().Set("X-Seen-Proxy-Authorization", r.Header.Get("Proxy-Authorization"))
+			io.WriteString(w, "ok")
+		}
+	}))
+	t.Cleanup(target.Close)
+
+	forward := &httputil.ReverseProxy{
+		Director:  func(*http.Request) {},
+		Transport: &http.Transport{Proxy: nil},
+	}
+	parent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Proxy-Authorization") != testParentAuth {
+			http.Error(w, "authentication required", http.StatusProxyAuthRequired)
+			return
+		}
+		forward.ServeHTTP(w, r)
+	}))
+	t.Cleanup(parent.Close)
+
+	cfg := Config{ParentProxy: parent.URL, Username: username, Password: password, StopIfAuthFail: true}
+	proxy, err := newProxyServer(cfg, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(proxy.transport.CloseIdleConnections)
+	server := httptest.NewServer(proxy)
+	t.Cleanup(server.Close)
+	proxyURL, err = url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return target, proxy, proxyURL
+}
+
+func TestProxyForwardsRequestsTransparently(t *testing.T) {
+	target, _, proxyURL := newForwardingTestProxy(t, "user", "pass")
+	client := &http.Client{
+		Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	defer client.CloseIdleConnections()
+
+	resp, err := client.Get(target.URL + "/redirect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("redirect status = %d, want %d (redirects must reach the client)", resp.StatusCode, http.StatusFound)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, target.URL+"/hello", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Proxy-Authorization", "Basic Y2xpZW50OnNlY3JldA==")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "ok" {
+		t.Fatalf("response = %d %q, want 200 ok", resp.StatusCode, body)
+	}
+	if seen := resp.Header.Get("X-Seen-Proxy-Authorization"); seen != "" {
+		t.Fatalf("target received Proxy-Authorization %q, want none", seen)
+	}
+}
+
+func TestProxyForwardsWebSocketUpgrade(t *testing.T) {
+	target, _, proxyURL := newForwardingTestProxy(t, "user", "pass")
+	conn, err := net.DialTimeout("tcp", proxyURL.Host, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	targetHost := strings.TrimPrefix(target.URL, "http://")
+	fmt.Fprintf(conn, "GET http://%s/ws HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n", targetHost, targetHost)
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("status = %d, want 101", resp.StatusCode)
+	}
+	io.WriteString(conn, "ping\n")
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line != "echo ping\n" {
+		t.Fatalf("upgraded connection returned %q, want %q", line, "echo ping\n")
+	}
+}
+
+func TestProxyStopsAfterParentAuthenticationFailure(t *testing.T) {
+	target, proxy, proxyURL := newForwardingTestProxy(t, "user", "wrong")
+	var failures atomic.Int32
+	proxy.onAuthFailure = func() { failures.Add(1) }
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	defer client.CloseIdleConnections()
+
+	for _, want := range []int{http.StatusProxyAuthRequired, http.StatusServiceUnavailable} {
+		resp, err := client.Get(target.URL + "/hello")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Fatalf("status = %d, want %d", resp.StatusCode, want)
+		}
+	}
+	if got := failures.Load(); got != 1 {
+		t.Fatalf("onAuthFailure called %d times, want 1", got)
 	}
 }

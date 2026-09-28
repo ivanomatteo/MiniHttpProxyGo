@@ -17,12 +17,12 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -96,110 +96,9 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 	}
 	logger := log.New(logOut, "mini-proxy: ", log.LstdFlags)
 
-	// parent proxy URL
-	parentURL, err := url.Parse(cfg.ParentProxy)
+	proxy, err := newProxyServer(cfg, logger)
 	if err != nil {
-		return fmt.Errorf("invalid parent_proxy: %w", err)
-	}
-
-	// prepare basic auth header value for Proxy-Authorization
-	proxyAuth := ""
-	if cfg.Username != "" || cfg.Password != "" {
-		b := cfg.Username + ":" + cfg.Password
-		proxyAuth = "Basic " + base64.StdEncoding.EncodeToString([]byte(b))
-	}
-
-	// transport that uses the parent proxy
-	transport := &http.Transport{
-		Proxy: http.ProxyURL(parentURL),
-		DialContext: (&net.Dialer{
-			Timeout:   connectTimeout,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		TLSHandshakeTimeout: 10 * time.Second,
-		ForceAttemptHTTP2:   false,
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-	}
-
-	client := &http.Client{
-		Transport: transport,
-	}
-
-	var authenticationFailed atomic.Bool
-	var stopOnce sync.Once
-	var stopForAuthenticationFailure func()
-
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		if authenticationFailed.Load() {
-			http.Error(w, "Proxy stopped: parent proxy authentication failed", http.StatusServiceUnavailable)
-			return
-		}
-		start := time.Now()
-		clientIP := r.RemoteAddr
-		targetHost := r.Host
-
-		procInfo := ""
-		if cfg.Debug {
-			procInfo = identifyProcess(clientIP)
-			if procInfo != "" {
-				procInfo = " [" + procInfo + "]"
-			}
-		}
-
-		// check blacklist
-		if isBlocked(targetHost, cfg.BlockedHosts) {
-			logger.Printf("BLOCKED %s%s %s %s -> %s", clientIP, procInfo, r.Method, r.URL.String(), targetHost)
-			http.Error(w, "Forbidden by proxy (blocked)", http.StatusForbidden)
-			return
-		}
-
-		if r.Method == http.MethodConnect {
-			if err := handleConnect(w, r, parentURL, proxyAuth, logger); err != nil {
-				logger.Printf("FAILED CONNECT %s%s %s -> %v", clientIP, procInfo, r.Host, err)
-				if cfg.StopIfAuthFail && errors.Is(err, errParentProxyAuthentication) {
-					stopForAuthenticationFailure()
-				}
-			} else {
-				logger.Printf("TUNNELED %s%s %s %s in %s", clientIP, procInfo, r.Method, r.Host, time.Since(start))
-			}
-			return
-		}
-
-		reqOut := r.Clone(r.Context())
-		reqOut.RequestURI = ""
-		if !reqOut.URL.IsAbs() {
-			scheme := "http"
-			if r.TLS != nil {
-				scheme = "https"
-			}
-			reqOut.URL.Scheme = scheme
-			reqOut.URL.Host = r.Host
-		}
-
-		if proxyAuth != "" {
-			reqOut.Header = cloneHeader(r.Header)
-			reqOut.Header.Set("Proxy-Authorization", proxyAuth)
-		} else {
-			reqOut.Header = cloneHeader(r.Header)
-		}
-
-		resp, err := client.Do(reqOut)
-		if err != nil {
-			logger.Printf("FAILED %s %s %s -> %v", clientIP, r.Method, r.URL.String(), err)
-			http.Error(w, "Bad Gateway", http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
-		if cfg.StopIfAuthFail && resp.StatusCode == http.StatusProxyAuthRequired {
-			stopForAuthenticationFailure()
-		}
-
-		copyHeader(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		if _, err := io.Copy(w, resp.Body); err != nil {
-			logger.Printf("FAILED copy back %s %s -> %v", clientIP, r.URL.String(), err)
-		}
-		logger.Printf("PROXIED %s%s %s %s -> %d in %s", clientIP, procInfo, r.Method, r.URL.String(), resp.StatusCode, time.Since(start))
+		return err
 	}
 
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
@@ -210,23 +109,29 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 
 	httpServer := &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: http.HandlerFunc(handler),
+		Handler: proxy,
+		// Only bounds reading request headers: tunnels and upgraded connections
+		// are hijacked and are not affected.
+		ReadHeaderTimeout: connectTimeout,
+		IdleTimeout:       2 * time.Minute,
 	}
-	stopForAuthenticationFailure = func() {
-		stopOnce.Do(func() {
-			authenticationFailed.Store(true)
-			message := "ERROR parent proxy rejected credentials or requires authentication; stopping proxy"
-			logger.Print(message)
-			if logFile != nil {
-				fmt.Fprintf(os.Stdout, "mini-proxy: %s\n", message)
+	proxy.onAuthFailure = func() {
+		message := "ERROR parent proxy rejected credentials or requires authentication; stopping proxy"
+		logger.Print(message)
+		if logFile != nil {
+			fmt.Fprintf(os.Stdout, "mini-proxy: %s\n", message)
+		}
+		proxy.transport.CloseIdleConnections()
+		go func() {
+			// Shutdown lets the request that received the 407 deliver its response
+			// before the connection is closed; new connections are refused at once.
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := httpServer.Shutdown(ctx); err != nil && err != http.ErrServerClosed {
+				httpServer.Close()
+				logger.Printf("FAILED stopping server gracefully after parent authentication error: %v", err)
 			}
-			transport.CloseIdleConnections()
-			go func() {
-				if err := httpServer.Close(); err != nil && err != http.ErrServerClosed {
-					logger.Printf("FAILED stopping server after parent authentication error: %v", err)
-				}
-			}()
-		})
+		}()
 	}
 
 	go func() {
@@ -243,6 +148,148 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 		return fmt.Errorf("server error: %w", err)
 	}
 	return nil
+}
+
+// proxyServer forwards plain HTTP requests (including ws:// upgrades) through
+// the parent proxy and tunnels CONNECT requests.
+type proxyServer struct {
+	cfg       Config
+	parentURL *url.URL
+	proxyAuth string // Proxy-Authorization value for the parent, empty when disabled
+	transport *http.Transport
+	logger    *log.Logger
+
+	authFailed    atomic.Bool
+	onAuthFailure func() // called once when the parent rejects the credentials
+}
+
+func newProxyServer(cfg Config, logger *log.Logger) (*proxyServer, error) {
+	parentURL, err := url.Parse(cfg.ParentProxy)
+	if err != nil {
+		return nil, fmt.Errorf("invalid parent_proxy: %w", err)
+	}
+	if parentURL.Scheme != "http" && parentURL.Scheme != "https" {
+		return nil, fmt.Errorf("invalid parent_proxy: unsupported scheme %q", parentURL.Scheme)
+	}
+
+	proxyAuth := ""
+	transportProxyURL := *parentURL
+	if cfg.Username != "" || cfg.Password != "" {
+		b := cfg.Username + ":" + cfg.Password
+		proxyAuth = "Basic " + base64.StdEncoding.EncodeToString([]byte(b))
+		// The transport derives Proxy-Authorization from the proxy URL, both for
+		// forwarded requests and for CONNECT to https:// targets.
+		transportProxyURL.User = url.UserPassword(cfg.Username, cfg.Password)
+	}
+
+	// transport that uses the parent proxy
+	transport := &http.Transport{
+		Proxy: http.ProxyURL(&transportProxyURL),
+		DialContext: (&net.Dialer{
+			Timeout:   connectTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
+		ForceAttemptHTTP2:   false,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+		// Pass bodies through unchanged instead of negotiating gzip on behalf of
+		// the client.
+		DisableCompression: true,
+		// Plain HTTP requests for every destination share the connections to the
+		// parent proxy, so keep more than the default two idle.
+		MaxIdleConnsPerHost: 32,
+		IdleConnTimeout:     90 * time.Second,
+	}
+
+	return &proxyServer{
+		cfg:       cfg,
+		parentURL: parentURL,
+		proxyAuth: proxyAuth,
+		transport: transport,
+		logger:    logger,
+	}, nil
+}
+
+func (p *proxyServer) parentAuthenticationFailed() {
+	if !p.cfg.StopIfAuthFail {
+		return
+	}
+	if p.authFailed.CompareAndSwap(false, true) && p.onAuthFailure != nil {
+		p.onAuthFailure()
+	}
+}
+
+func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if p.authFailed.Load() {
+		http.Error(w, "Proxy stopped: parent proxy authentication failed", http.StatusServiceUnavailable)
+		return
+	}
+	start := time.Now()
+	clientIP := r.RemoteAddr
+	targetHost := r.Host
+
+	procInfo := ""
+	if p.cfg.Debug {
+		procInfo = identifyProcess(clientIP)
+		if procInfo != "" {
+			procInfo = " [" + procInfo + "]"
+		}
+	}
+
+	// check blacklist
+	if isBlocked(targetHost, p.cfg.BlockedHosts) {
+		p.logger.Printf("BLOCKED %s%s %s %s -> %s", clientIP, procInfo, r.Method, r.URL.String(), targetHost)
+		http.Error(w, "Forbidden by proxy (blocked)", http.StatusForbidden)
+		return
+	}
+
+	if r.Method == http.MethodConnect {
+		if err := handleConnect(w, r, p.parentURL, p.proxyAuth, p.logger); err != nil {
+			p.logger.Printf("FAILED CONNECT %s%s %s -> %v", clientIP, procInfo, r.Host, err)
+			if errors.Is(err, errParentProxyAuthentication) {
+				p.parentAuthenticationFailed()
+			}
+		} else {
+			p.logger.Printf("TUNNELED %s%s %s %s in %s", clientIP, procInfo, r.Method, r.Host, time.Since(start))
+		}
+		return
+	}
+
+	var proxyErr error
+	status := 0
+	forwarder := &httputil.ReverseProxy{
+		Transport: p.transport,
+		Director: func(out *http.Request) {
+			if !out.URL.IsAbs() {
+				out.URL.Scheme = "http"
+				out.URL.Host = r.Host
+			}
+			// ReverseProxy would otherwise add the client address; a client
+			// supplied X-Forwarded-For is still passed on.
+			if _, ok := out.Header["X-Forwarded-For"]; !ok {
+				out.Header["X-Forwarded-For"] = nil
+			}
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			status = resp.StatusCode
+			if resp.StatusCode == http.StatusProxyAuthRequired {
+				p.parentAuthenticationFailed()
+			}
+			return nil
+		},
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			proxyErr = err
+			w.WriteHeader(http.StatusBadGateway)
+		},
+		ErrorLog: p.logger,
+	}
+	forwarder.ServeHTTP(w, r)
+
+	if proxyErr != nil {
+		p.logger.Printf("FAILED %s%s %s %s -> %v", clientIP, procInfo, r.Method, r.URL.String(), proxyErr)
+		return
+	}
+	p.logger.Printf("PROXIED %s%s %s %s -> %d in %s", clientIP, procInfo, r.Method, r.URL.String(), status, time.Since(start))
 }
 
 func loadConfig(cfgPath string) (Config, error) {
@@ -544,36 +591,23 @@ func (l *sourceFilterListener) Accept() (net.Conn, error) {
 	}
 }
 
+// isBlocked reports whether host (optionally with a port) equals a blocked
+// entry or is a subdomain of it.
 func isBlocked(host string, blocked []string) bool {
-	host = strings.ToLower(host)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
 	for _, b := range blocked {
-		bb := strings.ToLower(strings.TrimSpace(b))
+		bb := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(b)), ".")
 		if bb == "" {
 			continue
 		}
-		if host == bb || strings.HasSuffix(host, "."+bb) || strings.HasSuffix(host, bb) {
+		if host == bb || strings.HasSuffix(host, "."+bb) {
 			return true
 		}
 	}
 	return false
-}
-
-func cloneHeader(h http.Header) http.Header {
-	nh := make(http.Header)
-	for k, vv := range h {
-		for _, v := range vv {
-			nh.Add(k, v)
-		}
-	}
-	return nh
-}
-
-func copyHeader(dst, src http.Header) {
-	for k, vv := range src {
-		for _, v := range vv {
-			dst.Add(k, v)
-		}
-	}
 }
 
 // handleConnect sends a CONNECT to the parent proxy (with Proxy-Authorization if provided) and then tunnels the TCP streams.
@@ -587,6 +621,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, parent *url.URL, prox
 	}
 	defer upConn.Close()
 	if err := upConn.SetDeadline(time.Now().Add(connectTimeout)); err != nil {
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return fmt.Errorf("set parent CONNECT deadline: %w", err)
 	}
 
@@ -624,6 +659,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, parent *url.URL, prox
 		return fmt.Errorf("parent CONNECT failed: %s", connectResponse.Status)
 	}
 	if err := upConn.SetDeadline(time.Time{}); err != nil {
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return fmt.Errorf("clear parent CONNECT deadline: %w", err)
 	}
 

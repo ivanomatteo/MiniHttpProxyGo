@@ -9,13 +9,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - Add the `accept_connection_from` configuration option: an array of source IP addresses and CIDR ranges (e.g. `["192.168.1.1", "192.168.20.0/24"]`) allowed to connect to the proxy. Connections from any other address are closed as soon as they are accepted and logged as `REJECTED`.
+- Support plain `ws://` WebSockets and other HTTP `Upgrade` protocols sent to the proxy as regular requests. `wss://` continues to use `CONNECT` tunnels.
 
 ### Security
 
+- Match `blocked_hosts` against the host name without its port. Previously any request carrying an explicit port, including every HTTPS `CONNECT` (`host:443`), bypassed the blocklist.
+- Stop forwarding the client's own `Proxy-Authorization` header, and other hop-by-hop headers, to the parent proxy and the destination.
+- Limit the time allowed for a client to send request headers.
 - Accept client connections only from loopback addresses (`127.0.0.1` and `::1`) by default. Deployments listening on a non-loopback interface must list their clients in `accept_connection_from` to keep accepting them.
 
 ### Fixed
 
+- Return redirects to the client instead of following them inside the proxy.
+- Stream responses to the client as they arrive, so Server-Sent Events and other long-lived responses are no longer held back until they complete.
+- Stop blocking domains that merely end with a blocked name: `example.com` no longer blocks `notexample.com`.
+- Deliver the parent proxy's `407` response to the client before stopping on `stop_if_auth_fail`, instead of dropping the connection.
+- Answer `502 Bad Gateway` when a `CONNECT` tunnel cannot be prepared, instead of an empty `200` that the client would treat as an established tunnel.
+- Pass response bodies through unchanged instead of negotiating gzip compression with the destination on the client's behalf.
+- Keep more idle connections to the parent proxy, which serves every plain HTTP request, reducing reconnections under load.
+- Reject a `parent_proxy` with a scheme other than `http` or `https` at startup.
 - Preserve client data buffered immediately after an HTTP `CONNECT` request. This prevents TLS handshakes from stalling in clients that send the TLS ClientHello eagerly, including Outlook and Teams.
 - Parse the parent proxy's complete `CONNECT` response instead of relying on a single fixed-size read.
 - Validate the parent proxy response using its actual HTTP status code, including explicit handling of `407 Proxy Authentication Required` and all successful `2xx` responses.
@@ -27,6 +39,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Tests
 
+- Add end-to-end tests through a parent proxy for redirects, header filtering, `ws://` upgrades and `stop_if_auth_fail`, and table tests for `blocked_hosts` matching.
 - Cover `accept_connection_from` parsing, defaults, validation, and rejection of disallowed source addresses.
 - Add an end-to-end regression test covering a `CONNECT` request followed immediately by tunneled client data in the same write.
 - Verify the tunnel implementation with the Go race detector and static analysis.

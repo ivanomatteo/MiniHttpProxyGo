@@ -4,6 +4,8 @@ A lightweight HTTP/HTTPS proxy written in Go. It supports parent proxy forwardin
 
 ## Features
 - **Parent Proxy Forwarding**: Forward requests to another HTTP/HTTPS proxy.
+- **Tunnels and WebSockets**: HTTPS and `wss://` through `CONNECT` tunnels; plain `ws://` (and other HTTP `Upgrade` protocols) forwarded as upgraded connections.
+- **Transparent Forwarding**: Redirects, streaming responses (e.g. Server-Sent Events) and compressed bodies are passed to the client unchanged.
 - **Authentication**: Supports Basic Auth for the parent proxy.
 - **Source IP Filtering**: Accept client connections only from allowed IP addresses or CIDR ranges (loopback only by default).
 - **Host Blacklisting**: Block specific domains or suffixes (e.g., `facebook.com`, `ads.example.com`).
@@ -41,9 +43,9 @@ Create a `config.json` file (see `sample-config.json`):
 | `password` | Password for parent proxy authentication. Leave empty to omit it, set to `[ask]` to request it at console startup, or provide a fixed value. |
 | `key_seed` | 20-character seed used to encrypt the stored password. It is generated automatically when missing. |
 | `log_file` | Path to the log file. If empty, logs to stdout. |
-| `blocked_hosts` | Array of hosts to block. Suffix matching is supported. |
+| `blocked_hosts` | Array of domains to block. An entry blocks the domain itself and all of its subdomains, on any port (e.g. `example.com` blocks `example.com:443` and `www.example.com`, but not `notexample.com`). |
 | `debug` | Enable extended logging, including process identification for local requests. |
-| `stop_if_auth_fail` | Stop accepting connections when the parent proxy returns HTTP 407. Defaults to `true`; set to `false` to keep forwarding requests. |
+| `stop_if_auth_fail` | Stop accepting connections when the parent proxy returns HTTP 407. The request that received the 407 still gets its response; requests already in progress get up to 5 seconds to complete. Defaults to `true`; set to `false` to keep forwarding requests. |
 
 Authentication is disabled when both `username` and `password` are empty. In console mode, each field set to `[ask]` is requested interactively at startup; password input is hidden and credentials are never written to the log. The `[ask]` value is not supported in service mode: startup fails with an error, because a service has no interactive console. Configure fixed credentials (or leave both fields empty) before installing or starting the service.
 
