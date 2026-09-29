@@ -78,8 +78,8 @@ func getProcessCommandLine(pid string) string {
 	scanner := bufio.NewScanner(&out)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "CommandLine=") {
-			return strings.TrimPrefix(line, "CommandLine=")
+		if after, ok := strings.CutPrefix(line, "CommandLine="); ok {
+			return after
 		}
 	}
 	return ""

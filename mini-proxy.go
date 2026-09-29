@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -395,9 +396,7 @@ func loadConfig(cfgPath string) (Config, error) {
 	}
 
 	configForDecode := make(map[string]json.RawMessage, len(raw))
-	for key, value := range raw {
-		configForDecode[key] = value
-	}
+	maps.Copy(configForDecode, raw)
 	configForDecode["password"], _ = json.Marshal(plainPassword)
 	decodeData, _ := json.Marshal(configForDecode)
 	if err := json.Unmarshal(decodeData, &cfg); err != nil {
