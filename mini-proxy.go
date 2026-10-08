@@ -40,8 +40,15 @@ type Config struct {
 	Password       string   `json:"password"`          // basic auth password for parent
 	LogFile        string   `json:"log_file"`          // e.g. "proxy.log"
 	BlockedHosts   []string `json:"blocked_hosts"`     // hosts to block (exact or suffix)
+	DirectHosts    []string `json:"direct_hosts"`      // hosts reached directly, overriding PAC and parent_proxy
 	Debug          bool     `json:"debug"`             // enable debug logging (e.g. client process ID)
 	StopIfAuthFail bool     `json:"stop_if_auth_fail"` // stop when the parent proxy returns HTTP 407
+
+	// PAC script (http(s) URL or local file) that chooses the upstream per
+	// request; mutually exclusive with parent_proxy.
+	PACURL string `json:"pac_url"`
+	// minutes between PAC reloads, 0 disables reloading
+	PACRefreshMinutes int `json:"pac_refresh_minutes"`
 	// source IPs or CIDR ranges allowed to connect, e.g. ["127.0.0.1", "192.168.20.0/24"]
 	AcceptConnectionFrom []string `json:"accept_connection_from"`
 	// TCP ports forwarded directly to a fixed destination, without the parent proxy
@@ -100,13 +107,7 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 	var logOut io.Writer = os.Stdout
 	var logFile *os.File
 	if cfg.LogFile != "" {
-		logFilePath := cfg.LogFile
-		if !filepath.IsAbs(logFilePath) {
-			exePath, err := os.Executable()
-			if err == nil {
-				logFilePath = filepath.Join(filepath.Dir(exePath), logFilePath)
-			}
-		}
+		logFilePath := exeRelativePath(cfg.LogFile)
 		f, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 		if err != nil {
 			return fmt.Errorf("open log file (%s): %w", logFilePath, err)
@@ -117,9 +118,15 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 	}
 	logger := log.New(logOut, "mini-proxy: ", log.LstdFlags)
 
+	cfg.PACURL = resolvePACPath(cfg.PACURL)
 	proxy, err := newProxyServer(cfg, logger)
 	if err != nil {
 		return err
+	}
+	if proxy.pac != nil {
+		pacCtx, stopPAC := context.WithCancel(context.Background())
+		defer stopPAC()
+		go proxy.pac.Run(pacCtx, time.Duration(cfg.PACRefreshMinutes)*time.Minute)
 	}
 
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
@@ -183,8 +190,8 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 		httpServer.Shutdown(ctx)
 	}()
 
-	logger.Printf("Starting mini proxy on %s, forwarding to %s, accepting connections from %s",
-		cfg.ListenAddr, cfg.ParentProxy, strings.Join(cfg.AcceptConnectionFrom, ", "))
+	logger.Printf("Starting mini proxy on %s, forwarding %s, accepting connections from %s",
+		cfg.ListenAddr, proxy.describeRouting(), strings.Join(cfg.AcceptConnectionFrom, ", "))
 	for _, tunnel := range tunnels {
 		logger.Printf("Starting TCP tunnel on %s, forwarding directly to %s, accepting connections from %s",
 			tunnel.cfg.SourceAddr, tunnel.cfg.target(), strings.Join(cfg.AcceptTCPConnectionFrom, ", "))
@@ -202,45 +209,86 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 	return nil
 }
 
-// proxyServer forwards plain HTTP requests (including ws:// upgrades) through
-// the parent proxy and tunnels CONNECT requests.
+// exeRelativePath resolves a relative path against the executable directory,
+// so that it does not depend on the working directory of a service.
+func exeRelativePath(path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	exePath, err := os.Executable()
+	if err != nil {
+		return path
+	}
+	return filepath.Join(filepath.Dir(exePath), path)
+}
+
+// resolvePACPath resolves a local pac_url like log_file; URLs are unchanged.
+func resolvePACPath(src string) string {
+	if src == "" || strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
+		return src
+	}
+	return exeRelativePath(strings.TrimPrefix(src, "file://"))
+}
+
+// proxyServer forwards plain HTTP requests (including ws:// upgrades) and
+// tunnels CONNECT requests, directly or through the upstream chosen by route.
 type proxyServer struct {
 	cfg       Config
-	parentURL *url.URL
-	proxyAuth string // Proxy-Authorization value for the parent, empty when disabled
+	parentURL *url.URL // nil when parent_proxy is not configured
+	proxyAuth string   // Proxy-Authorization value for the parent, empty when disabled
 	transport *http.Transport
 	logger    *log.Logger
+	pac       *pacManager // nil when pac_url is not configured
+	// local addresses of the connections this proxy opened, to detect
+	// requests that loop back to the proxy itself
+	ownConns sync.Map
 
 	authFailed    atomic.Bool
 	onAuthFailure func() // called once when the parent rejects the credentials
 }
 
 func newProxyServer(cfg Config, logger *log.Logger) (*proxyServer, error) {
-	parentURL, err := url.Parse(cfg.ParentProxy)
-	if err != nil {
-		return nil, fmt.Errorf("invalid parent_proxy: %w", err)
+	if cfg.ParentProxy != "" && cfg.PACURL != "" {
+		return nil, errors.New("parent_proxy and pac_url are mutually exclusive: set only one of them")
 	}
-	if parentURL.Scheme != "http" && parentURL.Scheme != "https" {
-		return nil, fmt.Errorf("invalid parent_proxy: unsupported scheme %q", parentURL.Scheme)
+	var parentURL *url.URL
+	// Without parent_proxy and pac_url every request goes DIRECT.
+	if cfg.ParentProxy != "" {
+		var err error
+		parentURL, err = url.Parse(cfg.ParentProxy)
+		if err != nil {
+			return nil, fmt.Errorf("invalid parent_proxy: %w", err)
+		}
+		if parentURL.Scheme != "http" && parentURL.Scheme != "https" {
+			return nil, fmt.Errorf("invalid parent_proxy: unsupported scheme %q", parentURL.Scheme)
+		}
 	}
 
 	proxyAuth := ""
-	transportProxyURL := *parentURL
 	if cfg.Username != "" || cfg.Password != "" {
 		b := cfg.Username + ":" + cfg.Password
 		proxyAuth = "Basic " + base64.StdEncoding.EncodeToString([]byte(b))
-		// The transport derives Proxy-Authorization from the proxy URL, both for
-		// forwarded requests and for CONNECT to https:// targets.
-		transportProxyURL.User = url.UserPassword(cfg.Username, cfg.Password)
 	}
 
-	// transport that uses the parent proxy
-	transport := &http.Transport{
-		Proxy: http.ProxyURL(&transportProxyURL),
-		DialContext: (&net.Dialer{
-			Timeout:   connectTimeout,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+	p := &proxyServer{
+		cfg:       cfg,
+		parentURL: parentURL,
+		proxyAuth: proxyAuth,
+		logger:    logger,
+	}
+
+	if cfg.PACURL != "" {
+		pac, err := newPACManager(cfg.PACURL, logger)
+		if err != nil {
+			return nil, fmt.Errorf("pac_url: %w", err)
+		}
+		p.pac = pac
+	}
+
+	// transport that picks the upstream per request
+	p.transport = &http.Transport{
+		Proxy:               p.transportProxy,
+		DialContext:         p.dialTracked,
 		TLSHandshakeTimeout: 10 * time.Second,
 		ForceAttemptHTTP2:   false,
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
@@ -252,14 +300,112 @@ func newProxyServer(cfg Config, logger *log.Logger) (*proxyServer, error) {
 		MaxIdleConnsPerHost: 32,
 		IdleConnTimeout:     90 * time.Second,
 	}
+	return p, nil
+}
 
-	return &proxyServer{
-		cfg:       cfg,
-		parentURL: parentURL,
-		proxyAuth: proxyAuth,
-		transport: transport,
-		logger:    logger,
-	}, nil
+// dialTracked dials like a plain dialer and records the local address of the
+// connection until it is closed. A request arriving from one of these
+// addresses was sent by this proxy to itself (e.g. a request for the proxy's
+// own address while connecting DIRECT) and would loop forever.
+func (p *proxyServer) dialTracked(ctx context.Context, network, addr string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
+	conn, err := dialer.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	key := conn.LocalAddr().String()
+	p.ownConns.Store(key, struct{}{})
+	return &trackedConn{Conn: conn, release: func() { p.ownConns.Delete(key) }}, nil
+}
+
+func (p *proxyServer) isOwnConn(remoteAddr string) bool {
+	_, ok := p.ownConns.Load(remoteAddr)
+	return ok
+}
+
+type trackedConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *trackedConn) Close() error {
+	c.once.Do(c.release)
+	return c.Conn.Close()
+}
+
+// CloseWrite keeps the half-close used by relayTunnel.
+func (c *trackedConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+// withAuth returns a copy of u carrying the configured parent credentials.
+// The transport derives Proxy-Authorization from the proxy URL, both for
+// forwarded requests and for CONNECT to https:// targets.
+func (p *proxyServer) withAuth(u *url.URL) *url.URL {
+	if u == nil || p.proxyAuth == "" {
+		return u
+	}
+	c := *u
+	c.User = url.UserPassword(p.cfg.Username, p.cfg.Password)
+	return &c
+}
+
+// describeRouting summarizes, for the startup log, where requests are sent.
+func (p *proxyServer) describeRouting() string {
+	switch {
+	case p.pac != nil:
+		src := p.cfg.PACURL
+		if u, err := url.Parse(src); err == nil && u.Host != "" {
+			src = u.Redacted()
+		}
+		return "as chosen by PAC " + src
+	case p.parentURL != nil:
+		return "to " + p.parentURL.Redacted()
+	default:
+		return "directly"
+	}
+}
+
+// route returns the ordered upstreams for a request, by priority:
+// direct_hosts, then the PAC or parent_proxy (mutually exclusive), then DIRECT
+// when neither is configured. A PAC failure is an error, not a silent DIRECT:
+// connecting directly is a policy decision.
+func (p *proxyServer) route(rawURL, host string) ([]pacRoute, error) {
+	if matchesHost(host, p.cfg.DirectHosts) {
+		return []pacRoute{{Direct: true}}, nil
+	}
+	if p.pac != nil {
+		return p.pac.FindProxy(rawURL, host)
+	}
+	if p.parentURL == nil {
+		return []pacRoute{{Direct: true}}, nil
+	}
+	return []pacRoute{{Proxy: p.parentURL}}, nil
+}
+
+// routeKey carries the route being tried to transportProxy, so the PAC is
+// evaluated once per request.
+type routeKey struct{}
+
+// transportProxy is http.Transport.Proxy. It uses the route that
+// roundTripRoutes is trying, or the first route when none is set.
+func (p *proxyServer) transportProxy(req *http.Request) (*url.URL, error) {
+	route, ok := req.Context().Value(routeKey{}).(pacRoute)
+	if !ok {
+		routes, err := p.route(req.URL.String(), req.URL.Hostname())
+		if err != nil {
+			return nil, err
+		}
+		route = routes[0]
+	}
+	if route.Direct {
+		return nil, nil
+	}
+	return p.withAuth(route.Proxy), nil
 }
 
 func (p *proxyServer) parentAuthenticationFailed() {
@@ -280,6 +426,12 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	clientIP := r.RemoteAddr
 	targetHost := r.Host
 
+	if p.isOwnConn(clientIP) {
+		p.logger.Printf("LOOP %s %s %s: request sent by this proxy to itself", clientIP, r.Method, r.URL.String())
+		http.Error(w, "Loop detected: the request targets this proxy", http.StatusLoopDetected)
+		return
+	}
+
 	procInfo := ""
 	if p.cfg.Debug {
 		procInfo = identifyProcess(clientIP)
@@ -288,15 +440,15 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// check blacklist
-	if isBlocked(targetHost, p.cfg.BlockedHosts) {
+	// check blacklist: it has priority over direct_hosts and the PAC
+	if matchesHost(targetHost, p.cfg.BlockedHosts) {
 		p.logger.Printf("BLOCKED %s%s %s %s -> %s", clientIP, procInfo, r.Method, r.URL.String(), targetHost)
 		http.Error(w, "Forbidden by proxy (blocked)", http.StatusForbidden)
 		return
 	}
 
 	if r.Method == http.MethodConnect {
-		if err := handleConnect(w, r, p.parentURL, p.proxyAuth, p.logger); err != nil {
+		if err := p.handleConnect(w, r); err != nil {
 			p.logger.Printf("FAILED CONNECT %s%s %s -> %v", clientIP, procInfo, r.Host, err)
 			if errors.Is(err, errParentProxyAuthentication) {
 				p.parentAuthenticationFailed()
@@ -307,24 +459,42 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	outURL := *r.URL
+	if !outURL.IsAbs() {
+		outURL.Scheme = "http"
+		outURL.Host = r.Host
+	}
+	routes, err := p.route(outURL.String(), outURL.Hostname())
+	if err != nil {
+		p.logger.Printf("FAILED %s%s %s %s -> %v", clientIP, procInfo, r.Method, r.URL.String(), err)
+		http.Error(w, "Bad Gateway: cannot choose an upstream", http.StatusBadGateway)
+		return
+	}
+
 	var proxyErr error
 	status := 0
+	var used pacRoute // the route that produced the response
 	forwarder := &httputil.ReverseProxy{
-		Transport: p.transport,
-		Director: func(out *http.Request) {
-			if !out.URL.IsAbs() {
-				out.URL.Scheme = "http"
-				out.URL.Host = r.Host
-			}
-			// ReverseProxy would otherwise add the client address; a client
-			// supplied X-Forwarded-For is still passed on.
-			if _, ok := out.Header["X-Forwarded-For"]; !ok {
-				out.Header["X-Forwarded-For"] = nil
+		Transport: roundTripperFunc(func(out *http.Request) (*http.Response, error) {
+			resp, route, err := p.roundTripRoutes(out, routes)
+			used = route
+			return resp, err
+		}),
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.Out.URL.Scheme = outURL.Scheme
+			pr.Out.URL.Host = outURL.Host
+			// Rewrite drops the forwarding headers and adds none: pass on the
+			// client's own unchanged, without adding the client address.
+			for _, name := range []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto"} {
+				if values, ok := pr.In.Header[name]; ok {
+					pr.Out.Header[name] = values
+				}
 			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			status = resp.StatusCode
-			if resp.StatusCode == http.StatusProxyAuthRequired {
+			// Only a proxy's 407 means the configured credentials were rejected.
+			if resp.StatusCode == http.StatusProxyAuthRequired && !used.Direct {
 				p.parentAuthenticationFailed()
 			}
 			return nil
@@ -344,9 +514,71 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.logger.Printf("PROXIED %s%s %s %s -> %d in %s", clientIP, procInfo, r.Method, r.URL.String(), status, time.Since(start))
 }
 
+// roundTripRoutes sends req through the routes in order, moving to the next
+// one only when the connection could not be established: the request has not
+// been sent yet, so retrying it is safe. A response (including a 407) or a
+// later error ends the walk, as for CONNECT.
+func (p *proxyServer) roundTripRoutes(req *http.Request, routes []pacRoute) (*http.Response, pacRoute, error) {
+	// The transport closes the body on errors; keep it open for the next route.
+	// The server closes the incoming body once the handler returns.
+	var body *retryBody
+	if req.Body != nil && req.Body != http.NoBody {
+		body = &retryBody{ReadCloser: req.Body}
+		req.Body = body
+	}
+	for i, route := range routes {
+		out := req.WithContext(context.WithValue(req.Context(), routeKey{}, route))
+		resp, err := p.transport.RoundTrip(out)
+		if err == nil {
+			if p.cfg.Debug {
+				p.logger.Printf("ROUTE %s %s via %s", req.Method, req.URL.Redacted(), route)
+			}
+			return resp, route, nil
+		}
+		if !isDialError(err) || (body != nil && body.read) || i == len(routes)-1 {
+			return nil, route, err
+		}
+		p.logger.Printf("FAILED route %s %s via %s: %v", req.Method, req.URL.Redacted(), route, err)
+	}
+	return nil, pacRoute{}, errors.New("no route") // unreachable: route never returns an empty list
+}
+
+// isDialError reports whether err happened while connecting, directly or to a
+// proxy, before anything of the request was sent.
+func isDialError(err error) bool {
+	for ; err != nil; err = errors.Unwrap(err) {
+		if op, ok := err.(*net.OpError); ok && op.Op == "dial" {
+			return true
+		}
+	}
+	return false
+}
+
+// retryBody ignores Close, so a request body survives a failed attempt, and
+// records whether any byte was consumed (then the request cannot be retried).
+type retryBody struct {
+	io.ReadCloser
+	read bool
+}
+
+func (b *retryBody) Read(buf []byte) (int, error) {
+	n, err := b.ReadCloser.Read(buf)
+	if n > 0 {
+		b.read = true
+	}
+	return n, err
+}
+
+func (b *retryBody) Close() error { return nil }
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
 func loadConfig(cfgPath string) (Config, error) {
 	cfg := Config{
 		StopIfAuthFail:          true,
+		PACRefreshMinutes:       60,
 		AcceptConnectionFrom:    []string{"127.0.0.1", "::1"},
 		AcceptTCPConnectionFrom: []string{"127.0.0.1", "::1"},
 	}
@@ -649,14 +881,14 @@ func (l *sourceFilterListener) Accept() (net.Conn, error) {
 	}
 }
 
-// isBlocked reports whether host (optionally with a port) equals a blocked
-// entry or is a subdomain of it.
-func isBlocked(host string, blocked []string) bool {
+// matchesHost reports whether host (optionally with a port) equals an entry
+// of list or is a subdomain of it. Used for blocked_hosts and direct_hosts.
+func matchesHost(host string, list []string) bool {
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
 	host = strings.TrimSuffix(strings.ToLower(host), ".")
-	for _, b := range blocked {
+	for _, b := range list {
 		bb := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(b)), ".")
 		if bb == "" {
 			continue
@@ -668,13 +900,71 @@ func isBlocked(host string, blocked []string) bool {
 	return false
 }
 
-// handleConnect sends a CONNECT to the parent proxy (with Proxy-Authorization if provided) and then tunnels the TCP streams.
 var errParentProxyAuthentication = errors.New("parent proxy authentication required or rejected")
 
 var errParentConnectRefused = errors.New("parent proxy refused CONNECT")
 
-func handleConnect(w http.ResponseWriter, r *http.Request, parent *url.URL, proxyAuth string, logger *log.Logger) error {
-	upConn, upReader, err := connectThroughParent(parent, proxyAuth, r.Host)
+// handleConnect tunnels r.Host through the upstream chosen by route.
+func (p *proxyServer) handleConnect(w http.ResponseWriter, r *http.Request) error {
+	upConn, upReader, err := p.dialConnectUpstream(r.Host)
+	return finishConnect(w, upConn, upReader, err, p.logger)
+}
+
+// dialConnectUpstream walks the routes in order until one gives a tunnel to
+// target. A proxy that answers the CONNECT with an error (407 included) stops
+// the walk, as for plain HTTP: only connection failures move to the next route.
+func (p *proxyServer) dialConnectUpstream(target string) (net.Conn, *bufio.Reader, error) {
+	routes, err := p.route(connectPACURL(target))
+	if err != nil {
+		return nil, nil, err
+	}
+	var lastErr error
+	for _, route := range routes {
+		var conn net.Conn
+		var reader *bufio.Reader
+		if route.Direct {
+			conn, err = p.dialTracked(context.Background(), "tcp", target)
+			if err == nil {
+				reader = bufio.NewReader(conn)
+			}
+		} else {
+			conn, reader, err = connectThroughParent(route.Proxy, p.proxyAuth, target)
+		}
+		if err == nil {
+			if p.cfg.Debug {
+				p.logger.Printf("ROUTE CONNECT %s via %s", target, route)
+			}
+			return conn, reader, nil
+		}
+		if errors.Is(err, errParentProxyAuthentication) || errors.Is(err, errParentConnectRefused) {
+			return nil, nil, err
+		}
+		p.logger.Printf("FAILED route CONNECT %s via %s: %v", target, route, err)
+		lastErr = err
+	}
+	return nil, nil, lastErr
+}
+
+// connectPACURL returns the URL and host a PAC receives for a CONNECT to
+// target: like browsers, https://host/ with the port only when it is not 443.
+func connectPACURL(target string) (rawURL, host string) {
+	h, port, err := net.SplitHostPort(target)
+	if err != nil {
+		return "https://" + target + "/", target
+	}
+	u := url.URL{Scheme: "https", Host: target, Path: "/"}
+	if port == "443" {
+		u.Host = h
+		if strings.Contains(h, ":") {
+			u.Host = "[" + h + "]"
+		}
+	}
+	return u.String(), h
+}
+
+// finishConnect answers the client once the upstream tunnel is (or is not)
+// ready, then relays the traffic.
+func finishConnect(w http.ResponseWriter, upConn net.Conn, upReader *bufio.Reader, err error, logger *log.Logger) error {
 	if err != nil {
 		w.WriteHeader(http.StatusBadGateway)
 		switch {

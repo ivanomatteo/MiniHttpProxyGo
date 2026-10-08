@@ -2,10 +2,14 @@
   "listen_addr": "127.0.0.1:3129",
   "accept_connection_from": ["127.0.0.1", "::1"],
   "parent_proxy": "http://proxy.test:3128",
+  "pac_url": "",
+  "pac_refresh_minutes": 60,
   "username": "[ask]",
   "password": "[ask]",
   "log_file": "proxy.log",
   "blocked_hosts": [
+  ],
+  "direct_hosts": [
   ],
   "debug": true,
   "stop_if_auth_fail": true,

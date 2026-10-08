@@ -71,12 +71,12 @@ func TestHandleConnectPreservesBufferedTunnelBytes(t *testing.T) {
 		parentDone <- err
 	}()
 
-	parentURL, err := url.Parse("http://" + parentListener.Addr().String())
+	proxy, err := newProxyServer(Config{ParentProxy: "http://" + parentListener.Addr().String()}, log.New(io.Discard, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
 	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := handleConnect(w, r, parentURL, "", log.New(io.Discard, "", 0)); err != nil {
+		if err := proxy.handleConnect(w, r); err != nil {
 			t.Errorf("handleConnect() error = %v", err)
 		}
 	}))
@@ -397,7 +397,7 @@ func TestSourceFilterListenerRejectsDisallowedSources(t *testing.T) {
 	}
 }
 
-func TestIsBlocked(t *testing.T) {
+func TestMatchesHost(t *testing.T) {
 	blocked := []string{"facebook.com", "Ads.Example.com."}
 	tests := []struct {
 		host string
@@ -415,8 +415,8 @@ func TestIsBlocked(t *testing.T) {
 		{host: "[::1]:443", want: false},
 	}
 	for _, tt := range tests {
-		if got := isBlocked(tt.host, blocked); got != tt.want {
-			t.Errorf("isBlocked(%q) = %v, want %v", tt.host, got, tt.want)
+		if got := matchesHost(tt.host, blocked); got != tt.want {
+			t.Errorf("matchesHost(%q) = %v, want %v", tt.host, got, tt.want)
 		}
 	}
 }
@@ -457,7 +457,7 @@ func newForwardingTestProxy(t *testing.T, username, password string) (target *ht
 	t.Cleanup(target.Close)
 
 	forward := &httputil.ReverseProxy{
-		Director:  func(*http.Request) {},
+		Rewrite:   func(*httputil.ProxyRequest) {},
 		Transport: &http.Transport{Proxy: nil},
 	}
 	parent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -717,5 +717,132 @@ func TestLoadConfigTCPTunnel(t *testing.T) {
 				t.Fatalf("loadConfig() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestProxyDirectWithoutParent(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/407" {
+			http.Error(w, "origin 407", http.StatusProxyAuthRequired)
+			return
+		}
+		io.WriteString(w, "ok")
+	}))
+	defer target.Close()
+
+	proxy, err := newProxyServer(Config{StopIfAuthFail: true}, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.transport.CloseIdleConnections()
+	server := httptest.NewServer(proxy)
+	defer server.Close()
+	proxyURL, _ := url.Parse(server.URL)
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	defer client.CloseIdleConnections()
+
+	resp, err := client.Get(target.URL + "/hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "ok" {
+		t.Fatalf("response = %d %q, want 200 ok", resp.StatusCode, body)
+	}
+
+	// A 407 from a destination reached directly is not a parent auth failure.
+	resp, err = client.Get(target.URL + "/407")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusProxyAuthRequired || proxy.authFailed.Load() {
+		t.Fatalf("status = %d, authFailed = %v; want 407 and the proxy still running", resp.StatusCode, proxy.authFailed.Load())
+	}
+
+	// CONNECT is tunneled directly to the destination.
+	conn, err := net.DialTimeout("tcp", proxyURL.Host, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	targetAddr := strings.TrimPrefix(target.URL, "http://")
+	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", targetAddr, targetAddr)
+	reader := bufio.NewReader(conn)
+	connectResp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
+	if err != nil || connectResp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT response = %v, %v", connectResp, err)
+	}
+	fmt.Fprintf(conn, "GET /hello HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", targetAddr)
+	tunneled, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(tunneled.Body)
+	tunneled.Body.Close()
+	if string(body) != "ok" {
+		t.Fatalf("tunneled body = %q, want ok", body)
+	}
+}
+
+func TestProxyDetectsLoopToItself(t *testing.T) {
+	proxy, err := newProxyServer(Config{}, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.transport.CloseIdleConnections()
+	server := httptest.NewServer(proxy)
+	defer server.Close()
+	proxyURL, _ := url.Parse(server.URL)
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}, Timeout: 5 * time.Second}
+	defer client.CloseIdleConnections()
+
+	// DIRECT to the proxy's own address would forward the request forever.
+	resp, err := client.Get(server.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusLoopDetected {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusLoopDetected)
+	}
+}
+
+func TestProxyKeepsClientForwardingHeaders(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "%q %q", r.Header.Values("X-Forwarded-For"), r.Header.Values("Forwarded"))
+	}))
+	defer target.Close()
+	proxy, err := newProxyServer(Config{}, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.transport.CloseIdleConnections()
+	server := httptest.NewServer(proxy)
+	defer server.Close()
+	proxyURL, _ := url.Parse(server.URL)
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	defer client.CloseIdleConnections()
+
+	get := func(header http.Header) string {
+		req, _ := http.NewRequest(http.MethodGet, target.URL, nil)
+		req.Header = header
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return string(body)
+	}
+	// The proxy adds no forwarding header of its own...
+	if got := get(http.Header{}); got != `[] []` {
+		t.Errorf("without client headers, target saw %s", got)
+	}
+	// ...and passes the client's ones unchanged.
+	if got := get(http.Header{"X-Forwarded-For": {"10.1.1.1"}, "Forwarded": {"for=10.1.1.1"}}); got != `["10.1.1.1"] ["for=10.1.1.1"]` {
+		t.Errorf("with client headers, target saw %s", got)
 	}
 }
