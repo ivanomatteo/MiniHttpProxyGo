@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] - 2026-10-23
+
+### Fixed
+
+- A tunnel (`CONNECT` or `tcp_tunnel`) closed by the peer with a reset or abort (`ECONNRESET`, `ECONNABORTED`, `EPIPE`, and `WSAECONNRESET`/`WSAECONNABORTED` on Windows) is now logged as `TUNNELED` instead of `FAILED`: clients such as Office routinely drop connections this way.
+- A failed tunnel is logged once instead of twice (`FAILED tunnel copy …` followed by `FAILED CONNECT …`).
+
+### Added
+
+- Add tests for a client resetting a tunnel and for the recognition of peer reset errors.
+
 ## [0.2.0]
 
 ### Added
