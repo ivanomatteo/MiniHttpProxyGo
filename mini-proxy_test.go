@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -844,5 +845,72 @@ func TestProxyKeepsClientForwardingHeaders(t *testing.T) {
 	// ...and passes the client's ones unchanged.
 	if got := get(http.Header{"X-Forwarded-For": {"10.1.1.1"}, "Forwarded": {"for=10.1.1.1"}}); got != `["10.1.1.1"] ["for=10.1.1.1"]` {
 		t.Errorf("with client headers, target saw %s", got)
+	}
+}
+
+// tcpPair returns the two ends of a loopback TCP connection.
+func tcpPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	dialed, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := listener.Accept()
+	if err != nil {
+		dialed.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		dialed.Close()
+		accepted.Close()
+	})
+	return dialed.(*net.TCPConn), accepted.(*net.TCPConn)
+}
+
+func TestRelayTunnelTreatsClientResetAsNormalEnd(t *testing.T) {
+	clientPeer, clientConn := tcpPair(t)
+	upConn, upPeer := tcpPair(t)
+
+	done := make(chan error, 1)
+	go func() { done <- relayTunnel(clientConn, clientConn, upConn, upConn) }()
+
+	// Make sure the relay is running before the reset.
+	if _, err := clientPeer.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 5)
+	upPeer.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(upPeer, buf); err != nil {
+		t.Fatalf("read relayed bytes: %v", err)
+	}
+
+	// Linger 0 makes Close send a RST instead of a FIN.
+	if err := clientPeer.SetLinger(0); err != nil {
+		t.Fatal(err)
+	}
+	clientPeer.Close()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("relayTunnel returned %v, want nil after a client reset", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("relayTunnel did not end after the client reset")
+	}
+}
+
+func TestIsPeerReset(t *testing.T) {
+	reset := &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}
+	if !isPeerReset(fmt.Errorf("readfrom: %w", reset)) {
+		t.Error("wrapped ECONNRESET not recognized as a peer reset")
+	}
+	if isPeerReset(io.ErrUnexpectedEOF) || isPeerReset(syscall.ETIMEDOUT) {
+		t.Error("unrelated error recognized as a peer reset")
 	}
 }

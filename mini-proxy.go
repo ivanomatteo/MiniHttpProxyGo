@@ -907,7 +907,7 @@ var errParentConnectRefused = errors.New("parent proxy refused CONNECT")
 // handleConnect tunnels r.Host through the upstream chosen by route.
 func (p *proxyServer) handleConnect(w http.ResponseWriter, r *http.Request) error {
 	upConn, upReader, err := p.dialConnectUpstream(r.Host)
-	return finishConnect(w, upConn, upReader, err, p.logger)
+	return finishConnect(w, upConn, upReader, err)
 }
 
 // dialConnectUpstream walks the routes in order until one gives a tunnel to
@@ -964,7 +964,7 @@ func connectPACURL(target string) (rawURL, host string) {
 
 // finishConnect answers the client once the upstream tunnel is (or is not)
 // ready, then relays the traffic.
-func finishConnect(w http.ResponseWriter, upConn net.Conn, upReader *bufio.Reader, err error, logger *log.Logger) error {
+func finishConnect(w http.ResponseWriter, upConn net.Conn, upReader *bufio.Reader, err error) error {
 	if err != nil {
 		w.WriteHeader(http.StatusBadGateway)
 		switch {
@@ -1003,7 +1003,7 @@ func finishConnect(w http.ResponseWriter, upConn net.Conn, upReader *bufio.Reade
 	// clientRW.Reader and upReader preserve bytes which were read ahead while
 	// parsing CONNECT. Dropping either buffer can lose a TLS ClientHello or the
 	// first bytes returned by the destination.
-	return relayTunnel(clientConn, clientRW.Reader, upConn, upReader, logger)
+	return relayTunnel(clientConn, clientRW.Reader, upConn, upReader)
 }
 
 // connectThroughParent opens a CONNECT tunnel to target on the parent proxy.
@@ -1078,7 +1078,9 @@ func dialParentProxy(parent *url.URL) (net.Conn, error) {
 	}
 }
 
-func relayTunnel(clientConn net.Conn, clientReader io.Reader, upConn net.Conn, upReader io.Reader, logger *log.Logger) error {
+// relayTunnel copies both directions until they end. The caller logs the
+// returned error: a peer that closes or resets its side is a normal end.
+func relayTunnel(clientConn net.Conn, clientReader io.Reader, upConn net.Conn, upReader io.Reader) error {
 	type copyResult struct {
 		direction string
 		err       error
@@ -1105,8 +1107,7 @@ func relayTunnel(clientConn net.Conn, clientReader io.Reader, upConn net.Conn, u
 	second := <-results
 
 	for _, result := range []copyResult{first, second} {
-		if result.err != nil && !errors.Is(result.err, net.ErrClosed) {
-			logger.Printf("FAILED tunnel copy %s: %v", result.direction, result.err)
+		if result.err != nil && !errors.Is(result.err, net.ErrClosed) && !isPeerReset(result.err) {
 			return fmt.Errorf("copy %s: %w", result.direction, result.err)
 		}
 	}
@@ -1228,7 +1229,7 @@ func (t *tcpTunnelServer) handle(clientConn net.Conn) {
 	}
 	defer t.untrack(upConn)
 
-	if err := relayTunnel(clientConn, clientConn, upConn, upConn, t.logger); err != nil {
+	if err := relayTunnel(clientConn, clientConn, upConn, upConn); err != nil {
 		t.logger.Printf("FAILED TCP tunnel %s%s %s -> %s: %v", clientIP, procInfo, t.cfg.SourceAddr, target, err)
 		return
 	}
