@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-10-23
+
+### Added
+
+- Add an optional in-memory HTTP cache for plain HTTP requests, implemented in the separate `httpcache` package and enabled with the new `cache_enabled` option (default `false`). It follows RFC 9111 for a shared cache: `Cache-Control` (`no-store`, `private`, `no-cache`, `max-age`, `s-maxage`, `must-revalidate`, `proxy-revalidate`, `public` and the request directives `max-age`, `min-fresh`, `max-stale`, `only-if-cached`), `Expires`, heuristic freshness from `Last-Modified`, `Age`, validation with `ETag`/`Last-Modified`, `Vary` variants and invalidation by unsafe methods. Responses that set cookies are never stored.
+- Add the `cache_max_memory_mb` option (default `64`): the memory the cache may use. Entries are evicted with GDSF (Greedy-Dual-Size-Frequency); a response larger than 1/8 of the limit is not stored.
+- Report the cache outcome (`HIT`, `REVALIDATED`, `MISS`, `BYPASS`) in the `PROXIED` log lines when the cache is enabled.
+
 ## [0.2.1] - 2026-10-23
 
 ### Fixed
@@ -119,7 +127,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - First release: HTTP/HTTPS proxy forwarding to a parent proxy with Basic authentication, `blocked_hosts`, process identification in debug mode, and Systemd and Windows service support.
 
-[Unreleased]: https://github.com/ivanomatteo/MiniHttpProxyGo/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/ivanomatteo/MiniHttpProxyGo/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ivanomatteo/MiniHttpProxyGo/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/ivanomatteo/MiniHttpProxyGo/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/ivanomatteo/MiniHttpProxyGo/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/ivanomatteo/MiniHttpProxyGo/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/ivanomatteo/MiniHttpProxyGo/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/ivanomatteo/MiniHttpProxyGo/compare/v0.1.2...v0.1.3

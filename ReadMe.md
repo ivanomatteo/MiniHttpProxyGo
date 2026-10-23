@@ -7,6 +7,7 @@ A lightweight HTTP/HTTPS proxy written in Go. It supports parent proxy forwardin
 - **PAC Support**: Choose the upstream per request with a proxy auto-config script.
 - **Direct Hosts**: Reach selected domains directly, bypassing the parent proxy and the PAC.
 - **Tunnels and WebSockets**: HTTPS and `wss://` through `CONNECT` tunnels; plain `ws://` (and other HTTP `Upgrade` protocols) forwarded as upgraded connections.
+- **HTTP Cache**: Optional in-memory cache of plain HTTP responses that follows their caching headers (RFC 9111), with a memory limit and GDSF replacement.
 - **Transparent Forwarding**: Redirects, streaming responses (e.g. Server-Sent Events) and compressed bodies are passed to the client unchanged.
 - **Authentication**: Supports Basic Auth for the parent proxy.
 - **Source IP Filtering**: Accept client connections only from allowed IP addresses or CIDR ranges (loopback only by default).
@@ -36,7 +37,9 @@ Create a `config.json` file (see `sample-config.json`):
   "tcp_tunnel": [
     {"source_addr": "127.0.0.1:2222", "target_host": "10.0.0.10", "target_port": 22}
   ],
-  "accept_tcp_connection_from": ["127.0.0.1", "::1"]
+  "accept_tcp_connection_from": ["127.0.0.1", "::1"],
+  "cache_enabled": true,
+  "cache_max_memory_mb": 64
 }
 ```
 
@@ -58,6 +61,8 @@ Create a `config.json` file (see `sample-config.json`):
 | `pac_refresh_minutes` | Minutes between PAC reloads. Defaults to `60`; `0` disables reloading. A failed reload keeps the previous script. |
 | `tcp_tunnel` | Array of direct TCP port forwards, independent of the proxy (see [TCP Tunnels](#tcp-tunnels)). Omit it or leave it empty to disable tunnels. |
 | `accept_tcp_connection_from` | Array of source IP addresses and CIDR ranges allowed to connect to the TCP tunnels, with the same syntax as `accept_connection_from`. Defaults to `["127.0.0.1", "::1"]` when omitted. |
+| `cache_enabled` | Enable the in-memory HTTP cache (see [HTTP Cache](#http-cache)). Defaults to `false`. |
+| `cache_max_memory_mb` | Memory the cache may use, in MiB. Defaults to `64`; must be greater than `0` when the cache is enabled. |
 
 Authentication is disabled when both `username` and `password` are empty. In console mode, each field set to `[ask]` is requested interactively at startup; password input is hidden and credentials are never written to the log. The `[ask]` value is not supported in service mode: startup fails with an error, because a service has no interactive console. Configure fixed credentials (or leave both fields empty) before installing or starting the service.
 
@@ -106,8 +111,22 @@ Each `tcp_tunnel` entry is a plain port forward, like `ssh -L` or a netcat relay
 With the example configuration above, `ssh -p 2222 user@127.0.0.1` reaches the SSH server on `10.0.0.10:22`.
 
 - Connections are filtered by `accept_tcp_connection_from`, checked the same way as `accept_connection_from` for the proxy. The two lists are independent.
-- `blocked_hosts` and `stop_if_auth_fail` apply only to the HTTP proxy. When the proxy stops after a parent `407`, the tunnels keep running until the program is stopped.
+- `blocked_hosts`, `stop_if_auth_fail` and the [HTTP cache](#http-cache) apply only to the HTTP proxy: tunnels relay raw bytes and are never cached. When the proxy stops after a parent `407`, the tunnels keep running until the program is stopped.
 - An invalid entry, or a `source_addr` that cannot be bound, prevents startup.
+
+### HTTP Cache
+With `cache_enabled` set to `true`, responses to plain HTTP requests are kept in memory and reused as a shared cache would, following [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111). HTTPS traffic goes through `CONNECT` tunnels, which are encrypted end to end, and is never cached.
+
+- **What is stored**: responses to `GET` requests with a cacheable status (`200`, `203`, `204`, `300`, `301`, `308`, `404`, `405`, `410`, `414`, `501`; `302`, `303` and `307` only with explicit freshness) that are fresh for some time or can be validated (`ETag` or `Last-Modified`).
+- **What is never stored**: responses with `Cache-Control: no-store` or `private`, with `Vary: *`, or that set cookies (`Set-Cookie`); responses to requests with `Authorization`, unless marked `public`, `must-revalidate` or `s-maxage`; requests with `Cache-Control: no-store`, `Range`, `Upgrade` or a body; incomplete bodies.
+- **Freshness**: `s-maxage`, then `max-age`, then `Expires` minus `Date`. Without them, a response with `Last-Modified` is fresh for 10% of its age, up to 24 hours. The `Age` received from upstream and the time spent in the cache are added up, and sent to the client in `Age`.
+- **Validation**: a stale response with validators is revalidated with `If-None-Match`/`If-Modified-Since`; on `304` it is refreshed with the new headers and served. `Cache-Control: no-cache` (response or request, or request `Pragma: no-cache`) forces a revalidation every time.
+- **Request directives**: `max-age`, `min-fresh`, `max-stale` (ignored for `must-revalidate`, `proxy-revalidate` and `s-maxage` responses) and `only-if-cached` (`504` when not in the cache) are honored. A client's `If-None-Match`/`If-Modified-Since` is answered with `304` from a stored response.
+- **Vary**: each combination of the request headers listed in `Vary` (e.g. `Accept-Encoding`) is stored as a separate variant.
+- **Invalidation**: a successful `POST`, `PUT`, `DELETE`, `PATCH` (or any other unsafe method) drops the stored responses for its URL and for its `Location` and `Content-Location` on the same host.
+- **Memory**: entries are evicted with GDSF (Greedy-Dual-Size-Frequency), which keeps the entries with the best ratio of uses to size and lets the popularity of entries no longer requested decay over time, so a scan of one-time URLs does not flush frequently used objects. A single response larger than 1/8 of `cache_max_memory_mb` is not stored.
+
+Each `PROXIED` log line reports the outcome: `cache HIT`, `cache REVALIDATED` (served after a `304`), `cache MISS` (forwarded, possibly stored) or `cache BYPASS` (not cacheable).
 
 ## Debug Mode: Process Identification
 When `debug` is set to `true`, the proxy attempts to identify the local process initiating the request.

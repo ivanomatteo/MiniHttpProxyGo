@@ -914,3 +914,101 @@ func TestIsPeerReset(t *testing.T) {
 		t.Error("unrelated error recognized as a peer reset")
 	}
 }
+
+func TestLoadConfigCache(t *testing.T) {
+	tests := []struct {
+		name        string
+		json        string
+		wantEnabled bool
+		wantMB      int
+		wantErr     bool
+	}{
+		{name: "disabled by default", json: `{}`, wantMB: 64},
+		{name: "enabled with default memory", json: `{"cache_enabled":true}`, wantEnabled: true, wantMB: 64},
+		{name: "enabled with memory", json: `{"cache_enabled":true,"cache_max_memory_mb":256}`, wantEnabled: true, wantMB: 256},
+		{name: "invalid memory", json: `{"cache_enabled":true,"cache_max_memory_mb":0}`, wantErr: true},
+		{name: "invalid memory ignored when disabled", json: `{"cache_max_memory_mb":0}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(tt.json), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := loadConfig(path)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("loadConfig() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err == nil && (cfg.CacheEnabled != tt.wantEnabled || cfg.CacheMaxMemoryMB != tt.wantMB) {
+				t.Fatalf("cache = %v %d MiB, want %v %d MiB", cfg.CacheEnabled, cfg.CacheMaxMemoryMB, tt.wantEnabled, tt.wantMB)
+			}
+		})
+	}
+}
+
+func TestProxyCachesResponses(t *testing.T) {
+	var calls atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.URL.Path == "/cacheable" {
+			w.Header().Set("Cache-Control", "max-age=60")
+		}
+		fmt.Fprintf(w, "%s %s", r.Method, r.URL.Path)
+	}))
+	defer target.Close()
+
+	run := func(t *testing.T, cfg Config) (logs string, callsByStep []int32) {
+		var logBuf bytes.Buffer
+		proxy, err := newProxyServer(cfg, log.New(&logBuf, "", 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proxy.transport.CloseIdleConnections()
+		server := httptest.NewServer(proxy)
+		defer server.Close()
+		proxyURL, _ := url.Parse(server.URL)
+		client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+		defer client.CloseIdleConnections()
+
+		calls.Store(0)
+		for _, step := range []struct{ method, path string }{
+			{"GET", "/cacheable"}, {"GET", "/cacheable"}, {"GET", "/plain"}, {"GET", "/plain"},
+			{"POST", "/cacheable"}, {"GET", "/cacheable"},
+		} {
+			req, _ := http.NewRequest(step.method, target.URL+step.path, nil)
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if want := step.method + " " + step.path; string(body) != want {
+				t.Fatalf("%s %s body = %q, want %q", step.method, step.path, body, want)
+			}
+			callsByStep = append(callsByStep, calls.Load())
+		}
+		return logBuf.String(), callsByStep
+	}
+
+	t.Run("enabled", func(t *testing.T) {
+		logs, got := run(t, Config{CacheEnabled: true, CacheMaxMemoryMB: 1})
+		// the second GET is a hit; the POST invalidates the stored response
+		if want := []int32{1, 1, 2, 3, 4, 5}; fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("origin calls after each step = %v, want %v", got, want)
+		}
+		for _, want := range []string{"-> 200 cache MISS", "-> 200 cache HIT", "-> 200 cache BYPASS"} {
+			if !strings.Contains(logs, want) {
+				t.Errorf("log does not contain %q:\n%s", want, logs)
+			}
+		}
+	})
+	t.Run("disabled", func(t *testing.T) {
+		logs, got := run(t, Config{CacheMaxMemoryMB: 1})
+		if want := []int32{1, 2, 3, 4, 5, 6}; fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("origin calls after each step = %v, want %v", got, want)
+		}
+		if strings.Contains(logs, " cache ") {
+			t.Errorf("log mentions the cache while it is disabled:\n%s", logs)
+		}
+	})
+}

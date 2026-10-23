@@ -15,5 +15,7 @@
   "stop_if_auth_fail": true,
   "tcp_tunnel": [
   ],
-  "accept_tcp_connection_from": ["127.0.0.1", "::1"]
+  "accept_tcp_connection_from": ["127.0.0.1", "::1"],
+  "cache_enabled": false,
+  "cache_max_memory_mb": 64
 }

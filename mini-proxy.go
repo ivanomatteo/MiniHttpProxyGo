@@ -30,6 +30,8 @@ import (
 	"time"
 
 	"golang.org/x/term"
+
+	"mini-proxy/httpcache"
 )
 
 // Config structure read from JSON file
@@ -55,6 +57,10 @@ type Config struct {
 	TCPTunnels []TCPTunnel `json:"tcp_tunnel"`
 	// source IPs or CIDR ranges allowed to connect to the TCP tunnels
 	AcceptTCPConnectionFrom []string `json:"accept_tcp_connection_from"`
+	// in-memory cache of plain HTTP responses, following their caching headers
+	CacheEnabled bool `json:"cache_enabled"`
+	// memory the cache may use, in MiB
+	CacheMaxMemoryMB int `json:"cache_max_memory_mb"`
 
 	allowedSources    []netip.Prefix
 	allowedTCPSources []netip.Prefix
@@ -192,6 +198,9 @@ func runProxy(cfgPath string, stopChan <-chan struct{}, serviceMode bool) error 
 
 	logger.Printf("Starting mini proxy on %s, forwarding %s, accepting connections from %s",
 		cfg.ListenAddr, proxy.describeRouting(), strings.Join(cfg.AcceptConnectionFrom, ", "))
+	if proxy.cache != nil {
+		logger.Printf("HTTP cache enabled, up to %d MiB in memory", cfg.CacheMaxMemoryMB)
+	}
 	for _, tunnel := range tunnels {
 		logger.Printf("Starting TCP tunnel on %s, forwarding directly to %s, accepting connections from %s",
 			tunnel.cfg.SourceAddr, tunnel.cfg.target(), strings.Join(cfg.AcceptTCPConnectionFrom, ", "))
@@ -238,7 +247,8 @@ type proxyServer struct {
 	proxyAuth string   // Proxy-Authorization value for the parent, empty when disabled
 	transport *http.Transport
 	logger    *log.Logger
-	pac       *pacManager // nil when pac_url is not configured
+	pac       *pacManager      // nil when pac_url is not configured
+	cache     *httpcache.Cache // nil when cache_enabled is false
 	// local addresses of the connections this proxy opened, to detect
 	// requests that loop back to the proxy itself
 	ownConns sync.Map
@@ -283,6 +293,9 @@ func newProxyServer(cfg Config, logger *log.Logger) (*proxyServer, error) {
 			return nil, fmt.Errorf("pac_url: %w", err)
 		}
 		p.pac = pac
+	}
+	if cfg.CacheEnabled {
+		p.cache = httpcache.New(int64(cfg.CacheMaxMemoryMB) << 20)
 	}
 
 	// transport that picks the upstream per request
@@ -474,10 +487,19 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var proxyErr error
 	status := 0
 	var used pacRoute // the route that produced the response
+	var cacheStatus httpcache.Status
+	upstream := roundTripperFunc(func(out *http.Request) (*http.Response, error) {
+		resp, route, err := p.roundTripRoutes(out, routes)
+		used = route
+		return resp, err
+	})
 	forwarder := &httputil.ReverseProxy{
 		Transport: roundTripperFunc(func(out *http.Request) (*http.Response, error) {
-			resp, route, err := p.roundTripRoutes(out, routes)
-			used = route
+			if p.cache == nil {
+				return upstream(out)
+			}
+			resp, status, err := p.cache.RoundTrip(out, upstream)
+			cacheStatus = status
 			return resp, err
 		}),
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -511,7 +533,11 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.logger.Printf("FAILED %s%s %s %s -> %v", clientIP, procInfo, r.Method, r.URL.String(), proxyErr)
 		return
 	}
-	p.logger.Printf("PROXIED %s%s %s %s -> %d in %s", clientIP, procInfo, r.Method, r.URL.String(), status, time.Since(start))
+	cacheInfo := ""
+	if cacheStatus != "" {
+		cacheInfo = " cache " + string(cacheStatus)
+	}
+	p.logger.Printf("PROXIED %s%s %s %s -> %d%s in %s", clientIP, procInfo, r.Method, r.URL.String(), status, cacheInfo, time.Since(start))
 }
 
 // roundTripRoutes sends req through the routes in order, moving to the next
@@ -581,6 +607,7 @@ func loadConfig(cfgPath string) (Config, error) {
 		PACRefreshMinutes:       60,
 		AcceptConnectionFrom:    []string{"127.0.0.1", "::1"},
 		AcceptTCPConnectionFrom: []string{"127.0.0.1", "::1"},
+		CacheMaxMemoryMB:        64,
 	}
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
@@ -645,6 +672,9 @@ func loadConfig(cfgPath string) (Config, error) {
 	}
 	if err := validateTCPTunnels(cfg.TCPTunnels); err != nil {
 		return cfg, fmt.Errorf("tcp_tunnel: %w", err)
+	}
+	if cfg.CacheEnabled && cfg.CacheMaxMemoryMB <= 0 {
+		return cfg, fmt.Errorf("cache_max_memory_mb must be greater than 0 when cache_enabled is true")
 	}
 
 	needsWrite := seedAdded
