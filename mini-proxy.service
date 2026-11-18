@@ -4,8 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=proxy
-Group=proxy
+User=mini-proxy
+Group=mini-proxy
 WorkingDirectory=/opt/mini-proxy
 ExecStart=/opt/mini-proxy/mini-proxy -service -config /opt/mini-proxy/config.json
 Restart=on-failure

@@ -85,10 +85,19 @@ type encryptedPassword struct {
 
 const connectTimeout = 30 * time.Second
 
+// version is set at release time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
 	serviceMode := flag.Bool("service", false, "run in service mode (disables interactive prompts)")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 
 	if err := runService(*cfgPath, *serviceMode); err != nil {
 		log.Fatalf("error: %v", err)

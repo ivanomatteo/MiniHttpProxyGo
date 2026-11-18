@@ -5,6 +5,7 @@ A lightweight HTTP/HTTPS proxy written in Go. It supports parent proxy forwardin
 ## Features
 - **Parent Proxy Forwarding**: Forward requests to another HTTP/HTTPS proxy, or connect directly when none is configured.
 - **PAC Support**: Choose the upstream per request with a proxy auto-config script.
+- **TCP Tunnels**: Plain port forwards to fixed destinations (like `ssh -L`), independent of the proxy.
 - **Direct Hosts**: Reach selected domains directly, bypassing the parent proxy and the PAC.
 - **Tunnels and WebSockets**: HTTPS and `wss://` through `CONNECT` tunnels; plain `ws://` (and other HTTP `Upgrade` protocols) forwarded as upgraded connections.
 - **HTTP Cache**: Optional in-memory cache of plain HTTP responses that follows their caching headers (RFC 9111), with a memory limit and GDSF replacement.
@@ -19,6 +20,17 @@ A lightweight HTTP/HTTPS proxy written in Go. It supports parent proxy forwardin
 ## Releases
 🚀 Download latest release from **[GitHub Releases](https://github.com/ivanomatteo/MiniHttpProxyGo/releases/latest)**.
 
+## Usage
+```bash
+./mini-proxy -config config.json
+```
+
+| Flag | Description |
+|------|-------------|
+| `-config` | Path to the configuration file. Defaults to `config.json`. |
+| `-service` | Run in service mode: no interactive prompts (the `[ask]` credential value is rejected). Used by the Systemd unit; on Windows the service mode is detected automatically. |
+| `-version` | Print the version and exit. |
+
 ## Configuration
 Create a `config.json` file (see `sample-config.json`):
 
@@ -27,6 +39,8 @@ Create a `config.json` file (see `sample-config.json`):
   "listen_addr": "127.0.0.1:3128",
   "accept_connection_from": ["127.0.0.1", "::1"],
   "parent_proxy": "http://proxy.example.com:8080",
+  "pac_url": "",
+  "pac_refresh_minutes": 60,
   "username": "your_user",
   "password": "your_password",
   "log_file": "proxy.log",
@@ -138,7 +152,7 @@ This is particularly useful for auditing which applications are generating traff
 ## Installation
 
 ### Linux (Systemd)
-1. Build the binary: `go build -o mini-proxy .`
+1. Build the binary: `go build -o mini-proxy .` and create a `config.json` next to it (both are copied by the script).
 2. Run the installation script:
    ```bash
    chmod +x install.sh
@@ -156,7 +170,7 @@ This is particularly useful for auditing which applications are generating traff
    ```bash
    GOOS=windows GOARCH=amd64 go build -o mini-proxy.exe .
    ```
-2. Run `install.bat` as Administrator.
+2. Create a `config.json` next to the binary, then run `install.bat` as Administrator.
    This will install the service using the Service Control Manager (SCM).
 3. The service `mini-proxy` will be created and started. Configuration and executable are located in `C:\mini-proxy`.
 
