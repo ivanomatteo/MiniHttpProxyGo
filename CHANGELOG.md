@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- Add the `-version` flag, which prints the version and exits. The version is set at release time through `-ldflags "-X main.version=..."` (it was passed by GoReleaser but not defined in the code) and is `dev` for local builds.
+- Document the command-line flags (`-config`, `-service`, `-version`), TCP tunnels in the feature list and the `config.json` prerequisite for installation in the ReadMe; add the PAC options to its example configuration.
+
+### Fixed
+
+- The Systemd unit `mini-proxy.service` ran as `proxy:proxy`, a user the installation script does not create, so the service could not start; it now uses the `mini-proxy` user and group.
+
 ## [0.3.0] - 2026-10-23
 
 ### Added
@@ -23,7 +34,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Add tests for a client resetting a tunnel and for the recognition of peer reset errors.
 
-## [0.2.0]
+## [0.2.0] - 2026-10-08
 
 ### Added
 
